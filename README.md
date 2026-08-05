@@ -1,16 +1,12 @@
 # dev-proxy
 
-**Charles Proxy, minus the GUI, so your AI agent can drive it.**
+**Charles Proxy, but runs using natural language in Claude.**
 
 Mock an API, force a 500, add 3s of latency, or flip a server-driven feature
-flag — by editing a JSON file instead of clicking through dialogs.
+flag — by asking your agent to do it instead of clicking through dialogs.
 
 ```bash
-proxyctl rules add --json '{
-  "id": "empty_feed",
-  "match": {"host": "api\\.example\\.com", "path": "/feed"},
-  "action": {"type": "json_patch", "set": {"data.items": []}}
-}'
+in the splashScreenConfig, mock my_imaginary_enabled to true.
 ```
 
 Reload the screen on your phone. The feed is empty. No restart, no rebuild.
