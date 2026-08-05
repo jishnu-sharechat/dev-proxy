@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dev-proxy — live view</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --border: #dde1e6;
+    --text: #1a1d21; --text-muted: #6b7280; --text-dim: #9aa1ab;
+    --accent: #2f6fed; --good: #1a8a4a; --warn: #b4770a; --bad: #c23636;
+    --mock: #a35a00; --mock-bg: #fff3e0; --code-bg: #f0f1f3;
+    --row-hover: #eef2fb; --row-selected: #e3ecfd;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181d; --panel: #1e2126; --border: #2c3038;
+      --text: #e7e9ec; --text-muted: #9aa1ab; --text-dim: #6b7280;
+      --accent: #6d9bff; --good: #4fd087; --warn: #e0a530; --bad: #f16e6e;
+      --mock: #f0b155; --mock-bg: #3a2e12; --code-bg: #26292f;
+      --row-hover: #23283a; --row-selected: #263454;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #16181d; --panel: #1e2126; --border: #2c3038;
+    --text: #e7e9ec; --text-muted: #9aa1ab; --text-dim: #6b7280;
+    --accent: #6d9bff; --good: #4fd087; --warn: #e0a530; --bad: #f16e6e;
+    --mock: #f0b155; --mock-bg: #3a2e12; --code-bg: #26292f;
+    --row-hover: #23283a; --row-selected: #263454;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f6f8; --panel: #ffffff; --border: #dde1e6;
+    --text: #1a1d21; --text-muted: #6b7280; --text-dim: #9aa1ab;
+    --accent: #2f6fed; --good: #1a8a4a; --warn: #b4770a; --bad: #c23636;
+    --mock: #a35a00; --mock-bg: #fff3e0; --code-bg: #f0f1f3;
+    --row-hover: #eef2fb; --row-selected: #e3ecfd;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  code, pre, .mono { font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+
+  header {
+    display: flex; align-items: center; gap: 20px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex-shrink: 0;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; white-space: nowrap; }
+  header h1 span { color: var(--text-muted); font-weight: 400; }
+  .stats { display: flex; gap: 18px; flex: 1; }
+  .stat { display: flex; flex-direction: column; min-width: 54px; }
+  .stat .n { font-size: 17px; font-weight: 650; line-height: 1.1; }
+  .stat .l { font-size: 10.5px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+  .stat.good .n { color: var(--good); }
+  .stat.bad .n { color: var(--bad); }
+  .stat.warn .n { color: var(--warn); }
+  .live-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--good);
+    display: inline-block; margin-right: 6px; flex-shrink: 0;
+    animation: pulse 2s infinite;
+  }
+  .live-dot.stale { background: var(--text-dim); animation: none; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+  .stale-note { font-size: 11px; color: var(--text-dim); }
+
+  .filters {
+    display: flex; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex-shrink: 0; align-items: center;
+  }
+  .filters input, .filters select {
+    background: var(--code-bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 5px; padding: 5px 8px; font-size: 12px; font-family: inherit;
+  }
+  .filters input[type="text"] { flex: 1; min-width: 120px; }
+  .filters label { font-size: 11.5px; color: var(--text-muted); display: flex; align-items: center; gap: 4px; }
+  .rulebar { font-size: 11.5px; color: var(--text-muted); padding-left: 8px; border-left: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rulebar b { color: var(--text); }
+
+  main { flex: 1; display: flex; min-height: 0; }
+  .list { flex: 1.3; min-width: 0; overflow-y: auto; border-right: 1px solid var(--border); }
+  .detail { flex: 1; min-width: 0; overflow-y: auto; background: var(--panel); }
+
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  thead th {
+    position: sticky; top: 0; background: var(--panel); text-align: left;
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .03em;
+    color: var(--text-muted); padding: 6px 10px; border-bottom: 1px solid var(--border);
+    z-index: 1;
+  }
+  tbody tr { cursor: pointer; border-bottom: 1px solid var(--border); }
+  tbody tr:hover { background: var(--row-hover); }
+  tbody tr.selected { background: var(--row-selected); }
+  tbody tr.mocked { box-shadow: inset 3px 0 0 var(--mock); }
+  td { padding: 6px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  td.status { font-weight: 650; font-family: ui-monospace, monospace; }
+  td.status.s2 { color: var(--good); } td.status.s4, td.status.s5 { color: var(--bad); }
+  td.status.serr { color: var(--bad); }
+  td.method { color: var(--text-muted); font-family: ui-monospace, monospace; font-size: 11px; }
+  td.url .host { color: var(--text-muted); }
+  td.ms { text-align: right; font-family: ui-monospace, monospace; color: var(--text-muted); font-size: 11.5px; }
+  .tag {
+    display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 8px;
+    background: var(--mock-bg); color: var(--mock); margin-left: 6px; font-weight: 600;
+  }
+  .empty { padding: 40px 20px; text-align: center; color: var(--text-dim); }
+
+  .detail-inner { padding: 16px 18px; }
+  .detail-empty { padding: 40px 20px; text-align: center; color: var(--text-dim); }
+  .d-title { font-size: 14px; font-weight: 650; word-break: break-all; margin-bottom: 2px; }
+  .d-sub { color: var(--text-muted); font-size: 12px; margin-bottom: 14px; display: flex; gap: 12px; flex-wrap: wrap; }
+  .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+  .badge.ok { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge.err { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+  .badge.mock { background: var(--mock-bg); color: var(--mock); }
+  .section { margin-bottom: 16px; }
+  .section h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted);
+    margin: 0 0 6px; border-bottom: 1px solid var(--border); padding-bottom: 4px;
+  }
+  .hdrs { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; }
+  .hdrs .k { color: var(--text-muted); text-align: right; word-break: break-all; }
+  .hdrs .v { word-break: break-all; }
+  pre.body {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; max-height: 320px;
+  }
+  .filepath { color: var(--text-dim); font-size: 11px; margin-top: 4px; }
+  .why {
+    background: var(--mock-bg); color: var(--mock); border-radius: 6px; padding: 8px 10px;
+    font-size: 12px; margin-bottom: 14px;
+  }
+  .why b { display: block; margin-bottom: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>dev-proxy <span>live view</span></h1>
+  <div class="stats" id="stats"></div>
+  <div><span class="live-dot" id="dot"></span><span class="stale-note" id="staleNote"></span></div>
+</header>
+
+<div class="filters">
+  <input type="text" id="fHost" placeholder="host contains…">
+  <input type="text" id="fUrl" placeholder="path / grep…">
+  <select id="fStatus">
+    <option value="">any status</option>
+    <option value="2xx">2xx</option>
+    <option value="4xx">4xx</option>
+    <option value="5xx">5xx</option>
+    <option value="err">failed</option>
+    <option value="mock">rule-touched</option>
+  </select>
+  <label><input type="checkbox" id="fAutoscroll" checked> follow newest</label>
+  <div class="rulebar" id="ruleBar">loading rules…</div>
+</div>
+
+<main>
+  <div class="list"><table>
+    <thead><tr>
+      <th style="width:82px">time</th><th style="width:46px">st</th>
+      <th style="width:56px">meth</th><th>url</th><th style="width:56px">ms</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table></div>
+  <div class="detail" id="detail"><div class="detail-empty">Select a flow to inspect it — this is exactly<br>what <code>proxyctl show &lt;id&gt;</code> would print.</div></div>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let flows = [], rulesData = {rules: [], capture: {}}, selectedId = null, lastGoodFetch = 0;
+// A flow's log entry never changes once written, so the detail panel only
+// needs to redraw when the selection changes — not on every poll. Redrawing
+// it every tick reset the reader's scroll position each time a new request
+// came in, which looked like the panel was glitching while they were reading.
+let renderedDetailId = null;
+
+async function fetchText(path) {
+  const res = await fetch(path + "?t=" + Date.now(), {cache: "no-store"});
+  if (!res.ok) throw new Error(res.status);
+  return res.text();
+}
+
+function parseJsonl(text) {
+  const out = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line)); } catch (e) {}
+  }
+  return out;
+}
+
+function statusClass(f) {
+  if (f.error) return "serr";
+  if (!f.status) return "";
+  return "s" + String(f.status)[0];
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+function hostAndPath(f) {
+  try {
+    const u = new URL(f.url);
+    return {host: u.host, path: u.pathname + (u.search || "")};
+  } catch (e) {
+    return {host: f.host || "", path: f.url || ""};
+  }
+}
+
+function matchesFilters(f) {
+  const host = ($("#fHost").value || "").toLowerCase();
+  const urlq = ($("#fUrl").value || "").toLowerCase();
+  const st = $("#fStatus").value;
+  if (host && !(f.host || "").toLowerCase().includes(host)) return false;
+  if (urlq && !JSON.stringify(f).toLowerCase().includes(urlq)) return false;
+  if (st === "2xx" && !(f.status >= 200 && f.status < 300)) return false;
+  if (st === "4xx" && !(f.status >= 400 && f.status < 500)) return false;
+  if (st === "5xx" && !(f.status >= 500 && f.status < 600)) return false;
+  if (st === "err" && !f.error) return false;
+  if (st === "mock" && !(f.mocked || (f.rules && f.rules.length))) return false;
+  return true;
+}
+
+function renderRules() {
+  const active = (rulesData.rules || []).filter(r => r.enabled !== false);
+  const bar = $("#ruleBar");
+  if (!active.length) { bar.innerHTML = "no active rules"; return; }
+  bar.innerHTML = "<b>" + active.length + " active rule" + (active.length > 1 ? "s" : "") + "</b> — "
+    + active.map(r => esc(r.id)).join(", ");
+}
+
+function renderStats() {
+  const total = flows.length;
+  const ok = flows.filter(f => f.status && f.status < 400).length;
+  const bad = flows.filter(f => (f.status && f.status >= 400) || f.error).length;
+  const mocked = flows.filter(f => f.mocked || (f.rules && f.rules.length)).length;
+  $("#stats").innerHTML = `
+    <div class="stat"><div class="n">${total}</div><div class="l">flows</div></div>
+    <div class="stat good"><div class="n">${ok}</div><div class="l">ok</div></div>
+    <div class="stat bad"><div class="n">${bad}</div><div class="l">failed</div></div>
+    <div class="stat warn"><div class="n">${mocked}</div><div class="l">rule-touched</div></div>
+  `;
+}
+
+function renderRows() {
+  const filtered = flows.filter(matchesFilters);
+  const rows = $("#rows");
+  const wasAtSelectedScroll = rows.querySelector("tr.selected");
+  if (!filtered.length) {
+    rows.innerHTML = `<tr><td colspan="5" class="empty">no flows match. Try clearing the filters,<br>or run \`proxyctl app restart\` to capture traffic.</td></tr>`;
+    return;
+  }
+  rows.innerHTML = filtered.slice().reverse().map(f => {
+    const {host, path} = hostAndPath(f);
+    const tag = f.mocked ? "mock" : ((f.rules && f.rules.length) ? "rule" : "");
+    const sel = f.id === selectedId ? " selected" : "";
+    const mockCls = tag ? " mocked" : "";
+    const stxt = f.status ? f.status : (f.error ? "ERR" : "–");
+    return `<tr data-id="${f.id}" class="${sel}${mockCls}">
+      <td class="mono">${esc(f.time || "")}</td>
+      <td class="status ${statusClass(f)}">${stxt}</td>
+      <td class="method">${esc(f.method || "")}</td>
+      <td class="url"><span class="host">${esc(host)}</span>${esc(path)}${tag ? `<span class="tag">${tag}</span>` : ""}</td>
+      <td class="ms">${f.duration_ms ?? "–"}</td>
+    </tr>`;
+  }).join("");
+  if (!wasAtSelectedScroll && $("#fAutoscroll").checked) rows.parentElement.parentElement.scrollTop = 0;
+}
+
+function renderHeaders(obj) {
+  if (!obj || !Object.keys(obj).length) return "<div class='filepath'>none</div>";
+  return `<div class="hdrs">` + Object.entries(obj).map(([k,v]) =>
+    `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`).join("") + `</div>`;
+}
+
+async function renderBody(label, previewKey, fileKey, f) {
+  const preview = f[previewKey];
+  const file = f[fileKey];
+  if (!preview && !file) return "";
+  let full = preview || "";
+  if (file) {
+    try { full = await fetchText("../" + file); } catch (e) {}
+  }
+  return `<div class="section"><h3>${label}</h3><pre class="body">${esc(full)}</pre>${file ? `<div class="filepath">${esc(file)}</div>` : ""}</div>`;
+}
+
+async function renderDetail(f) {
+  const det = $("#detail");
+  if (!f) { det.innerHTML = `<div class="detail-empty">Select a flow to inspect it.</div>`; return; }
+  const {host, path} = hostAndPath(f);
+  let badges = "";
+  if (f.status) badges += `<span class="badge ${f.status < 400 ? 'ok' : 'err'}">${f.status}</span>`;
+  if (f.error) badges += `<span class="badge err">error</span>`;
+  if (f.mocked) badges += `<span class="badge mock">served locally</span>`;
+
+  let why = "";
+  if (f.rules && f.rules.length) {
+    why = `<div class="why"><b>Rules applied to this flow</b>${f.rules.map(esc).join(", ")}</div>`;
+  }
+  if (f.error) {
+    why += `<div class="why" style="background:color-mix(in srgb, var(--bad) 14%, transparent); color:var(--bad)"><b>Error</b>${esc(f.error)}${f.hint ? "<br>" + esc(f.hint) : ""}</div>`;
+  }
+
+  det.innerHTML = `<div class="detail-inner">
+    <div class="d-title">${esc(f.method || "")} ${esc(path)}</div>
+    <div class="d-sub"><span>${esc(host)}</span><span>${f.duration_ms ? f.duration_ms + " ms" : ""}</span>${badges}</div>
+    ${why}
+    <div class="section"><h3>request headers</h3>${renderHeaders(f.req_headers)}</div>
+    <div class="section"><h3>response headers</h3>${renderHeaders(f.resp_headers)}</div>
+    <div id="bodies"></div>
+  </div>`;
+
+  const reqBody = await renderBody("request body", "req_preview", "req_body_file", f);
+  const respBody = await renderBody("response body", "resp_preview", "resp_body_file", f);
+  det.querySelector("#bodies").innerHTML = reqBody + respBody;
+}
+
+function selectFlow(id) {
+  selectedId = id;
+  renderedDetailId = id;
+  location.hash = "#" + id;
+  renderRows();
+  renderDetail(flows.find(f => f.id === selectedId));
+}
+
+$("#rows").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr[data-id]");
+  if (!tr) return;
+  selectFlow(Number(tr.dataset.id));
+});
+
+// A URL like #42 opens straight to that flow — handy for sharing a link to one call.
+if (location.hash) {
+  const id = Number(location.hash.slice(1));
+  if (id) selectedId = id;
+}
+
+["fHost", "fUrl", "fStatus"].forEach(id => $("#" + id).addEventListener("input", renderRows));
+
+async function tick() {
+  try {
+    const [flowText, rulesText] = await Promise.all([
+      fetchText("../var/flows.jsonl"),
+      fetchText("../rules/rules.json"),
+    ]);
+    flows = parseJsonl(flowText);
+    try { rulesData = JSON.parse(rulesText); } catch (e) {}
+    lastGoodFetch = Date.now();
+    $("#dot").classList.remove("stale");
+    $("#staleNote").textContent = "live";
+    renderStats();
+    renderRules();
+    renderRows();
+    // Only draw the detail panel the first time a selected flow's data
+    // becomes available (e.g. right after a #id deep link loads), not on
+    // every poll — see the note by `renderedDetailId` above.
+    if (selectedId != null && selectedId !== renderedDetailId) {
+      const f = flows.find(x => x.id === selectedId);
+      if (f) { renderDetail(f); renderedDetailId = selectedId; }
+    }
+  } catch (e) {
+    $("#dot").classList.add("stale");
+    $("#staleNote").textContent = "cannot reach dev-proxy files — is `proxyctl web on` running?";
+  }
+}
+
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

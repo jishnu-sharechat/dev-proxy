@@ -1,0 +1,12 @@
+{
+  "capture": {
+    "save_bodies": true,
+    "max_body_kb": 1024,
+    "exclude_hosts": [
+      "^localhost$",
+      "^127\\.0\\.0\\.1$"
+    ],
+    "include_hosts": []
+  },
+  "rules": []
+}

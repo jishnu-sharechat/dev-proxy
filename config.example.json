@@ -1,0 +1,19 @@
+{
+  "port": 8080,
+  "web_port": 8081,
+  "dashboard_port": 8090,
+  "package": "com.example.yourapp",
+  "adb": "",
+  "mitmdump": "",
+  "proxy_bypass": [
+    "localhost",
+    "127.0.0.1",
+    "10.0.2.2",
+    "*.local"
+  ],
+  "main_activity": "",
+  "web_password": "",
+  "app_hosts": [
+    "example\\.com"
+  ]
+}

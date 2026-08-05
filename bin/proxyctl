@@ -1,0 +1,1103 @@
+#!/usr/bin/env python3
+"""proxyctl - control a mitmproxy instance for Android debug work.
+
+This is the single entry point an agent or a person uses. It starts the proxy,
+points the Android device at it, installs the CA certificate, queries captured
+traffic, and edits the interception rules.
+
+Run `proxyctl help` for the command list.
+"""
+
+import argparse
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+VAR = ROOT / "var"
+BODIES = VAR / "bodies"
+MAPS = ROOT / "maps"
+RULES_FILE = ROOT / "rules" / "rules.json"
+FLOWS_FILE = VAR / "flows.jsonl"
+DUMP_FILE = VAR / "flows.mitm"
+PID_FILE = VAR / "mitmproxy.pid"
+LOG_FILE = VAR / "mitm.log"
+READY_FILE = VAR / "ready"
+CONFIG_FILE = ROOT / "config.json"
+ADDON = ROOT / "addon" / "claude_addon.py"
+CA_DIR = Path.home() / ".mitmproxy"
+CA_PEM = CA_DIR / "mitmproxy-ca-cert.pem"
+WEBUI_DIR = ROOT / "webui"
+WEB_PID_FILE = VAR / "webui.pid"
+WEB_LOG_FILE = VAR / "webui.log"
+
+DEFAULT_BYPASS = ["localhost", "127.0.0.1", "10.0.2.2", "*.local"]
+
+DEFAULTS = {
+    "port": 8080,
+    "web_port": 8081,
+    "dashboard_port": 8090,
+    "package": "",
+    "adb": "",
+    "mitmdump": "",
+    "proxy_bypass": DEFAULT_BYPASS,
+    "main_activity": "",
+    "web_password": "",
+    "app_hosts": [],
+}
+
+C = {
+    "dim": "\033[2m", "red": "\033[31m", "green": "\033[32m",
+    "yellow": "\033[33m", "cyan": "\033[36m", "bold": "\033[1m", "off": "\033[0m",
+}
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    C = {k: "" for k in C}
+
+
+def die(msg, code=1):
+    print(f"{C['red']}error:{C['off']} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print(f"{C['cyan']}==>{C['off']} {msg}")
+
+
+def ok(msg):
+    print(f"{C['green']}ok{C['off']} {msg}")
+
+
+def warn(msg):
+    print(f"{C['yellow']}note:{C['off']} {msg}")
+
+
+# ------------------------------------------------------------------ config
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if CONFIG_FILE.exists():
+        try:
+            cfg.update(json.loads(CONFIG_FILE.read_text() or "{}"))
+        except json.JSONDecodeError as exc:
+            die(f"config.json is not valid JSON: {exc}")
+    cfg["adb"] = cfg["adb"] or _find_adb()
+    cfg["mitmdump"] = cfg["mitmdump"] or shutil.which("mitmdump") or "/opt/homebrew/bin/mitmdump"
+    return cfg
+
+
+def save_config(cfg):
+    keep = {k: v for k, v in cfg.items() if k in DEFAULTS}
+    CONFIG_FILE.write_text(json.dumps(keep, indent=2) + "\n")
+
+
+def _find_adb():
+    found = shutil.which("adb")
+    if found:
+        return found
+    for candidate in (
+        Path.home() / "Library/Android/sdk/platform-tools/adb",
+        Path("/usr/local/bin/adb"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return "adb"
+
+
+def adb(cfg, *args, check=False, capture=True, serial=None):
+    cmd = [cfg["adb"]]
+    serial = serial or os.environ.get("ANDROID_SERIAL")
+    if serial:
+        cmd += ["-s", serial]
+    cmd += [str(a) for a in args]
+    res = subprocess.run(
+        cmd, capture_output=capture, text=True, check=False
+    )
+    if check and res.returncode != 0:
+        die(f"adb {' '.join(str(a) for a in args)} failed: {(res.stderr or res.stdout).strip()}")
+    return res
+
+
+def devices(cfg):
+    out = adb(cfg, "devices").stdout or ""
+    found = []
+    for line in out.splitlines()[1:]:
+        if "\tdevice" in line:
+            found.append(line.split("\t")[0])
+    return found
+
+
+# ------------------------------------------------------------------- proxy
+
+def read_pid():
+    if not PID_FILE.exists():
+        return None
+    try:
+        pid = int(PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def cmd_start(cfg, args):
+    if read_pid():
+        warn(f"proxy already runs on port {cfg['port']} (pid {read_pid()})")
+        return
+    for d in (VAR, BODIES, MAPS, RULES_FILE.parent):
+        d.mkdir(parents=True, exist_ok=True)
+    if not RULES_FILE.exists():
+        RULES_FILE.write_text(json.dumps({"capture": {}, "rules": []}, indent=2) + "\n")
+
+    port = args.port or cfg["port"]
+    cmd = [
+        cfg["mitmdump"],
+        "-q",  # addon diagnostics go to var/addon.log instead
+        "-s", str(ADDON),
+        "--listen-port", str(port),
+        "--set", "connection_strategy=lazy",
+        "--set", "stream_large_bodies=10m",
+        "-w", str(DUMP_FILE),
+    ]
+    if args.web:
+        # mitmweb, unset, generates a random login token each start and prints
+        # it to the console. In mitmproxy 12.2.3 that printed token does not
+        # match what the server actually checks (confirmed: a manual login
+        # with it fails "Invalid Password" even copied byte for byte from the
+        # log). A password we set ourselves works every time, so use that
+        # instead of the broken auto-token flow.
+        if not cfg.get("web_password"):
+            cfg["web_password"] = secrets.token_hex(12)
+            save_config(cfg)
+        cmd = [
+            cfg["mitmdump"].replace("mitmdump", "mitmweb"),
+            "-s", str(ADDON),
+            "--listen-port", str(port),
+            "--web-port", str(cfg["web_port"]),
+            "--web-host", "127.0.0.1",
+            "--no-web-open-browser",
+            "--set", f"web_password={cfg['web_password']}",
+            "--set", "connection_strategy=lazy",
+            "--set", "stream_large_bodies=10m",
+            "-w", str(DUMP_FILE),
+        ]
+    if args.insecure:
+        cmd += ["--ssl-insecure"]
+    if args.upstream:
+        cmd += ["--mode", f"upstream:{args.upstream}"]
+
+    # Unbuffered, or the mitmweb login token sits in a stdio buffer and never
+    # reaches the log file while the process keeps running — only on exit.
+    env = dict(os.environ, DEVPROXY_HOME=str(ROOT), PYTHONUNBUFFERED="1")
+    READY_FILE.unlink(missing_ok=True)
+    with LOG_FILE.open("a") as logfh:
+        logfh.write(f"\n=== start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        proc = subprocess.Popen(
+            cmd, stdout=logfh, stderr=subprocess.STDOUT, env=env,
+            start_new_session=True,
+        )
+    # Wait for the addon, not just for the process. mitmdump accepts traffic
+    # before the addon finishes loading, and those early flows escape the rules.
+    for _ in range(120):
+        if proc.poll() is not None:
+            print(LOG_FILE.read_text()[-2000:])
+            die("mitmproxy exited immediately. See the log above.")
+        if READY_FILE.exists():
+            break
+        time.sleep(0.25)
+    else:
+        die("the addon did not report ready within 30s. Check " + str(LOG_FILE))
+    PID_FILE.write_text(str(proc.pid))
+    cfg["port"] = port
+    save_config(cfg)
+    ok(f"proxy listens on 0.0.0.0:{port} (pid {proc.pid})")
+    if args.web:
+        ok(f"mitmweb at http://127.0.0.1:{cfg['web_port']}/?token={cfg['web_password']}")
+        print(f"  or open http://127.0.0.1:{cfg['web_port']}/ and enter the "
+              f"password: {cfg['web_password']}")
+    print(f"  log:   {LOG_FILE}")
+    print(f"  flows: {FLOWS_FILE}")
+    print(f"  rule warnings: {VAR / 'addon.log'}")
+
+
+def cmd_stop(cfg, args):
+    pid = read_pid()
+    if not pid:
+        warn("proxy is not running")
+        PID_FILE.unlink(missing_ok=True)
+        return
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(20):
+        time.sleep(0.2)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+    else:
+        os.kill(pid, signal.SIGKILL)
+    PID_FILE.unlink(missing_ok=True)
+    READY_FILE.unlink(missing_ok=True)
+    ok(f"proxy stopped (pid {pid})")
+
+
+def cmd_restart(cfg, args):
+    cmd_stop(cfg, args)
+    time.sleep(0.5)
+    cmd_start(cfg, args)
+
+
+def cmd_status(cfg, args):
+    pid = read_pid()
+    print(f"{C['bold']}proxy{C['off']}    " + (
+        f"{C['green']}running{C['off']} pid {pid} port {cfg['port']}" if pid
+        else f"{C['red']}stopped{C['off']}"
+    ))
+    print(f"{C['bold']}ca cert{C['off']}  " + (
+        f"{CA_PEM}" if CA_PEM.exists() else f"{C['red']}missing{C['off']} (start the proxy once)"
+    ))
+    wpid = read_web_pid()
+    print(f"{C['bold']}dashboard{C['off']} " + (
+        f"{C['green']}http://127.0.0.1:{cfg['dashboard_port']}/webui/{C['off']}" if wpid
+        else f"{C['dim']}off{C['off']} (run `proxyctl web on`)"
+    ))
+    devs = devices(cfg)
+    print(f"{C['bold']}devices{C['off']}  " + (", ".join(devs) if devs else f"{C['red']}none{C['off']}"))
+    if devs:
+        proxy = (adb(cfg, "shell", "settings", "get", "global", "http_proxy").stdout or "").strip()
+        rev = (adb(cfg, "reverse", "--list").stdout or "").strip()
+        print(f"{C['bold']}device proxy{C['off']} {proxy or 'null'}")
+        broken = proxy.startswith("127.0.0.1") and f"tcp:{cfg['port']}" not in rev
+        print(f"{C['bold']}adb reverse{C['off']}  " + (rev or "none")
+              + (f"  {C['red']}<- missing, no traffic can arrive. "
+                 f"Run `proxyctl device on`.{C['off']}" if broken else ""))
+    rules = read_rules()
+    active = [r for r in rules.get("rules", []) if r.get("enabled", True)]
+    print(f"{C['bold']}rules{C['off']}    {len(active)} active / {len(rules.get('rules', []))} total")
+    for r in rules.get("rules", []):
+        mark = f"{C['green']}on {C['off']}" if r.get("enabled", True) else f"{C['dim']}off{C['off']}"
+        kinds = ",".join(
+            a.get("type", "?") for a in _as_list(r.get("action") or r.get("actions") or [])
+        )
+        print(f"  {mark} {r.get('id','?'):<12} {kinds:<14} {r.get('name','')}")
+    n = sum(1 for _ in FLOWS_FILE.open()) if FLOWS_FILE.exists() else 0
+    print(f"{C['bold']}flows{C['off']}    {n} captured")
+
+
+# ------------------------------------------------------------------ device
+
+def cmd_device(cfg, args):
+    if not devices(cfg):
+        die("no adb device. Connect the device and enable USB debugging.")
+    port = cfg["port"]
+    if args.action == "on":
+        if args.lan:
+            host = args.lan if args.lan is not True else _lan_ip()
+            target = f"{host}:{port}"
+        else:
+            adb(cfg, "reverse", f"tcp:{port}", f"tcp:{port}", check=True)
+            target = f"127.0.0.1:{port}"
+        host, _, tport = target.rpartition(":")
+        adb(cfg, "shell", "settings", "put", "global", "http_proxy", target, check=True)
+        adb(cfg, "shell", "settings", "put", "global", "global_http_proxy_host", host)
+        adb(cfg, "shell", "settings", "put", "global", "global_http_proxy_port", tport)
+        # Without a bypass list the global proxy also swallows the React Native
+        # Metro connection on localhost:8081, so the JS bundle never loads.
+        bypass = ",".join(cfg.get("proxy_bypass") or DEFAULT_BYPASS)
+        adb(cfg, "shell", "settings", "put", "global",
+            "global_http_proxy_exclusion_list", bypass)
+        ok(f"device proxy set to {target}")
+        print(f"  bypass: {bypass}")
+        warn("restart the app so it picks up the new proxy")
+    else:
+        adb(cfg, "shell", "settings", "put", "global", "http_proxy", ":0")
+        for key in ("http_proxy", "global_http_proxy_host", "global_http_proxy_port",
+                    "global_http_proxy_exclusion_list"):
+            adb(cfg, "shell", "settings", "delete", "global", key)
+        adb(cfg, "reverse", "--remove", f"tcp:{port}")
+        ok("device proxy removed")
+
+
+def ensure_reverse(cfg, quiet=False):
+    """Re-add the adb reverse tunnel if it went away.
+
+    The tunnel dies whenever the adb server restarts or the cable re-enumerates,
+    but the device keeps its http_proxy setting. Traffic then goes nowhere and
+    the flow log looks empty for no visible reason.
+    """
+    if not devices(cfg):
+        return False
+    port = cfg["port"]
+    proxy = (adb(cfg, "shell", "settings", "get", "global",
+                 "http_proxy").stdout or "").strip()
+    if not proxy.startswith("127.0.0.1"):
+        return False
+    rev = adb(cfg, "reverse", "--list").stdout or ""
+    if f"tcp:{port}" in rev:
+        return False
+    adb(cfg, "reverse", f"tcp:{port}", f"tcp:{port}")
+    if not quiet:
+        warn(f"the adb reverse tunnel was missing. Restored tcp:{port}.")
+    return True
+
+
+def _lan_ip():
+    for iface in ("en0", "en1"):
+        res = subprocess.run(["ipconfig", "getifaddr", iface], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    die("cannot detect a LAN IP address. Pass --lan <ip>.")
+
+
+# -------------------------------------------------------------------- cert
+
+def cmd_cert(cfg, args):
+    if not CA_PEM.exists():
+        die("CA certificate not found. Run `proxyctl start` once, then retry.")
+    if args.mode == "path":
+        print(CA_PEM)
+        return
+    if args.mode == "system":
+        _cert_system(cfg)
+        return
+    _cert_user(cfg)
+
+
+def _cert_hash(cfg):
+    res = subprocess.run(
+        ["openssl", "x509", "-inform", "PEM", "-subject_hash_old", "-in", str(CA_PEM)],
+        capture_output=True, text=True, check=False,
+    )
+    if res.returncode != 0:
+        die(f"openssl failed: {res.stderr.strip()}")
+    return res.stdout.strip().splitlines()[0]
+
+
+def _cert_user(cfg):
+    if not devices(cfg):
+        die("no adb device.")
+    name = "mitmproxy-ca.crt"
+    target = f"/sdcard/Download/{name}"
+    adb(cfg, "push", str(CA_PEM), target, check=True)
+    # Trigger a media scan so the file picker sees the file straight away.
+    adb(cfg, "shell", "am", "broadcast", "-a",
+        "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", f"file://{target}")
+    ok(f"pushed the certificate to {target}")
+    # This intent opens the CA installer file picker directly, which is far
+    # shorter than walking the Settings tree.
+    adb(cfg, "shell", "am", "start", "-a", "android.credentials.INSTALL")
+    print(f"""
+{C['bold']}Finish the install on the device. You do this only once.{C['off']}
+  1. A file picker is now open on the device.
+  2. Open the {C['cyan']}Downloads{C['off']} folder.
+  3. Tap {C['cyan']}{name}{C['off']}.
+  4. Accept the name, then tap OK. Confirm "Install anyway" if asked.
+
+Android will warn that a third party can watch the traffic. That warning is
+correct. It describes this proxy. Keep the certificate only on a test device.
+
+Then run: {C['cyan']}proxyctl cert verify{C['off']}
+
+If the picker does not show the file, open Settings yourself:
+  Biometrics and security > Other security settings >
+  Install from device storage > CA certificate
+""")
+
+
+def _cert_system(cfg):
+    """Install the CA into the system store. Emulator or rooted device only."""
+    if not devices(cfg):
+        die("no adb device.")
+    info("switching adb to root")
+    adb(cfg, "root")
+    time.sleep(2)
+    adb(cfg, "wait-for-device")
+    if "cannot" in (adb(cfg, "root").stdout or "").lower():
+        die("this device does not allow adb root. Use `proxyctl cert` instead, "
+            "or start the emulator with -writable-system.")
+
+    name = f"{_cert_hash(cfg)}.0"
+    adb(cfg, "push", str(CA_PEM), f"/data/local/tmp/{name}", check=True)
+    apex = "/apex/com.android.conscrypt/cacerts"
+    has_apex = adb(cfg, "shell", f"test -d {apex} && echo yes").stdout.strip() == "yes"
+
+    if has_apex:
+        info("using the APEX bind-mount route (Android 14+)")
+        script = (
+            "set -e; "
+            "mkdir -p /data/local/tmp/cacopy; "
+            f"cp {apex}/* /data/local/tmp/cacopy/; "
+            f"cp /data/local/tmp/{name} /data/local/tmp/cacopy/{name}; "
+            "chown root:root /data/local/tmp/cacopy/*; "
+            "chmod 644 /data/local/tmp/cacopy/*; "
+            f"mount --bind /data/local/tmp/cacopy {apex}; "
+            "echo bound"
+        )
+        res = adb(cfg, "shell", "su", "0", "sh", "-c", f"'{script}'")
+        if "bound" not in (res.stdout or ""):
+            res = adb(cfg, "shell", script)
+        if "bound" not in (res.stdout or ""):
+            die(f"bind mount failed: {(res.stderr or res.stdout).strip()}")
+        ok("certificate installed into the system store")
+        warn("the bind mount disappears on reboot. Re-run this command after a reboot.")
+    else:
+        adb(cfg, "remount", check=False)
+        res = adb(cfg, "shell", f"cp /data/local/tmp/{name} /system/etc/security/cacerts/{name} "
+                                f"&& chmod 644 /system/etc/security/cacerts/{name} && echo copied")
+        if "copied" not in (res.stdout or ""):
+            die(f"copy into /system failed: {(res.stderr or res.stdout).strip()}")
+        ok("certificate installed into /system/etc/security/cacerts")
+
+
+def cmd_cert_verify(cfg, args):
+    if not read_pid():
+        die("proxy is not running. Run `proxyctl start` first.")
+    ensure_reverse(cfg)
+    pkg = require_package(cfg)
+    before = _flow_count()
+    info(f"restarting {pkg} and watching for HTTPS traffic")
+    adb(cfg, "shell", "am", "force-stop", pkg)
+    time.sleep(1)
+    start_app(cfg, pkg)
+    # Wait for decrypted HTTPS, not just for any flow. Metro polls localhost and
+    # Google services fail on their own pinning, so the first few flows arrive
+    # fast and prove nothing. Stopping on a raw count misreports a working setup.
+    def _classify():
+        new = _read_flows()[before:]
+        https = [f for f in new if f.get("url", "").startswith("https")]
+        return (
+            new,
+            https,
+            [f for f in https if f.get("status")],
+            [f for f in https if f.get("error")],
+        )
+
+    for _ in range(max(args.wait, 8)):
+        time.sleep(1)
+        _, _, good, _ = _classify()
+        if len(good) >= 3:
+            break
+    new, https, good, bad = _classify()
+    print(f"  new flows: {len(new)}   https: {len(https)}   "
+          f"decrypted: {len(good)}   failed: {len(bad)}")
+    if good:
+        ok(f"HTTPS decryption works. The certificate is trusted. "
+           f"{len(good)}/{len(https)} HTTPS flows decrypted.")
+        hosts = sorted({f["host"] for f in good})
+        print(f"  decrypted hosts: {', '.join(hosts[:8])}")
+        # Optional: name your own backends in config.json as "app_hosts" and
+        # this reports on them specifically. Third party SDK traffic decrypting
+        # does not prove your API does.
+        patterns = cfg.get("app_hosts") or []
+        if patterns:
+            mine = [h for h in hosts
+                    if any(re.search(p, h, re.I) for p in patterns)]
+            if mine:
+                ok(f"your backends decrypt: {', '.join(mine)}")
+            else:
+                warn("none of your app_hosts decrypted yet. Open a screen that "
+                     "calls your API, then re-run.")
+        if bad:
+            warn(f"{len(bad)} HTTPS flow(s) still fail. Google and Play hosts "
+                 "pin their own certificates, so that is normal.")
+    elif https:
+        die("HTTPS flows appear but none decrypt. The CA is not trusted by the app.\n"
+            "  - Confirm the build is debuggable and trusts user CAs.\n"
+            "  - Re-run `proxyctl cert`.")
+    else:
+        die("no traffic reached the proxy. Run `proxyctl device on` and retry.")
+
+
+# ------------------------------------------------------------------- flows
+
+def _read_flows():
+    if not FLOWS_FILE.exists():
+        return []
+    out = []
+    for line in FLOWS_FILE.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _flow_count():
+    return sum(1 for _ in FLOWS_FILE.open()) if FLOWS_FILE.exists() else 0
+
+
+def _filter(flows, args):
+    out = []
+    for f in flows:
+        if args.host and not re.search(args.host, f.get("host", ""), re.I):
+            continue
+        if args.url and not re.search(args.url, f.get("url", ""), re.I):
+            continue
+        if args.method and f.get("method", "").upper() != args.method.upper():
+            continue
+        if args.status and str(f.get("status") or "") != str(args.status):
+            continue
+        if args.errors and not f.get("error"):
+            continue
+        if args.mocked and not f.get("mocked") and not f.get("rules"):
+            continue
+        if args.grep:
+            blob = json.dumps(f)
+            if not re.search(args.grep, blob, re.I):
+                continue
+        if args.min_ms and (f.get("duration_ms") or 0) < args.min_ms:
+            continue
+        out.append(f)
+    return out
+
+
+def cmd_flows(cfg, args):
+    flows = _filter(_read_flows(), args)
+    if args.last:
+        flows = flows[-args.last:]
+    if args.json:
+        print(json.dumps(flows, indent=2))
+        return
+    if not flows:
+        print("no matching flows")
+        return
+    print(f"{'ID':>6}  {'TIME':<8} {'ST':>3} {'MS':>6} {'METH':<6} {'SIZE':>8}  URL")
+    for f in flows:
+        st = f.get("status")
+        colour = C["green"] if st and st < 400 else (C["red"] if st else C["yellow"])
+        stxt = str(st) if st else ("ERR" if f.get("error") else "-")
+        size = _human(f.get("resp_size", 0))
+        url = f.get("url", "")
+        if len(url) > 88:
+            url = url[:85] + "..."
+        tag = ""
+        if f.get("mocked"):
+            tag = f" {C['yellow']}[mock]{C['off']}"
+        elif f.get("rules"):
+            tag = f" {C['cyan']}[{','.join(f['rules'])}]{C['off']}"
+        print(f"{f.get('id'):>6}  {f.get('time',''):<8} {colour}{stxt:>3}{C['off']} "
+              f"{f.get('duration_ms') or '-':>6} {f.get('method',''):<6} {size:>8}  {url}{tag}")
+    print(f"{C['dim']}{len(flows)} flow(s). Use `proxyctl show <ID>` for detail.{C['off']}")
+
+
+def _human(n):
+    for unit in ("B", "K", "M"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.1f}G"
+
+
+def cmd_show(cfg, args):
+    flows = {str(f.get("id")): f for f in _read_flows()}
+    f = flows.get(str(args.id))
+    if not f:
+        die(f"no flow with id {args.id}")
+    if args.json:
+        print(json.dumps(f, indent=2))
+        return
+    print(f"{C['bold']}#{f['id']}  {f.get('method')} {f.get('url')}{C['off']}")
+    print(f"  status {f.get('status')}   {f.get('duration_ms')} ms   "
+          f"req {_human(f.get('req_size',0))} / resp {_human(f.get('resp_size',0))}")
+    if f.get("rules"):
+        print(f"  {C['cyan']}rules applied: {', '.join(f['rules'])}{C['off']}")
+    if f.get("mocked"):
+        print(f"  {C['yellow']}served locally: {f['mocked']}{C['off']}")
+    if f.get("error"):
+        print(f"  {C['red']}error: {f['error']}{C['off']}")
+    if not args.body_only:
+        print(f"\n{C['bold']}request headers{C['off']}")
+        for k, v in (f.get("req_headers") or {}).items():
+            print(f"  {k}: {v}")
+        print(f"\n{C['bold']}response headers{C['off']}")
+        for k, v in (f.get("resp_headers") or {}).items():
+            print(f"  {k}: {v}")
+    for side, label in (("req", "request body"), ("resp", "response body")):
+        path = f.get(f"{side}_body_file")
+        preview = f.get(f"{side}_preview")
+        if not (path or preview):
+            continue
+        print(f"\n{C['bold']}{label}{C['off']}"
+              + (f" {C['dim']}({ROOT / path}){C['off']}" if path else ""))
+        if args.full and path and (ROOT / path).exists():
+            print((ROOT / path).read_text(errors="replace"))
+        else:
+            print(preview)
+
+
+def cmd_body(cfg, args):
+    flows = {str(f.get("id")): f for f in _read_flows()}
+    f = flows.get(str(args.id))
+    if not f:
+        die(f"no flow with id {args.id}")
+    path = f.get(f"{args.side}_body_file")
+    if not path:
+        die(f"flow {args.id} has no saved {args.side} body")
+    print(ROOT / path)
+
+
+def cmd_clear(cfg, args):
+    FLOWS_FILE.unlink(missing_ok=True)
+    for p in BODIES.glob("*"):
+        if p.is_file():
+            p.unlink()
+    ok("flow log and saved bodies cleared. Ids restart at 1.")
+    # The running mitmdump holds var/flows.mitm open. Deleting it here would
+    # send every later write to an unlinked inode and break `proxyctl har`.
+    # A restart reopens the file, so only reset it when the proxy is down.
+    if read_pid():
+        warn("the raw dump (for `proxyctl har`) still covers this whole proxy run. "
+             "Run `proxyctl restart` first if you need a clean HAR.")
+    else:
+        DUMP_FILE.unlink(missing_ok=True)
+
+
+def cmd_tail(cfg, args):
+    info("following new flows. Press Ctrl-C to stop.")
+    seen = _flow_count()
+    try:
+        while True:
+            flows = _read_flows()
+            for f in flows[seen:]:
+                st = f.get("status") or ("ERR" if f.get("error") else "-")
+                tag = f" [{','.join(f.get('rules', []))}]" if f.get("rules") else ""
+                print(f"{f.get('id'):>6} {f.get('time')} {str(st):>3} "
+                      f"{f.get('method'):<5} {f.get('url', '')[:100]}{tag}")
+            seen = len(flows)
+            time.sleep(0.7)
+    except KeyboardInterrupt:
+        print()
+
+
+# ------------------------------------------------------------------- rules
+
+def read_rules():
+    if not RULES_FILE.exists():
+        return {"capture": {}, "rules": []}
+    try:
+        return json.loads(RULES_FILE.read_text() or "{}")
+    except json.JSONDecodeError as exc:
+        die(f"rules.json is not valid JSON: {exc}")
+
+
+def write_rules(data):
+    """Write rules.json atomically.
+
+    The addon rereads this file on every request. A plain write lets a request
+    read a half-written file, which silently drops every rule for that request.
+    """
+    tmp = RULES_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(RULES_FILE)
+
+
+def _as_list(v):
+    return v if isinstance(v, list) else [v]
+
+
+def cmd_rules(cfg, args):
+    data = read_rules()
+    rules = data.setdefault("rules", [])
+
+    if args.action == "list":
+        print(json.dumps(data, indent=2))
+
+    elif args.action == "add":
+        raw = args.json or sys.stdin.read()
+        try:
+            new = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            die(f"rule is not valid JSON: {exc}")
+        for rule in _as_list(new):
+            rule.setdefault("enabled", True)
+            rule.setdefault("id", f"r{len(rules) + 1}")
+            _validate_rule(rule)
+            rules[:] = [r for r in rules if r.get("id") != rule["id"]]
+            rules.append(rule)
+            ok(f"rule {rule['id']} added")
+        write_rules(data)
+
+    elif args.action in ("rm", "remove"):
+        if not args.id:
+            die("pass a rule id")
+        before = len(rules)
+        data["rules"] = [r for r in rules if r.get("id") not in args.id]
+        write_rules(data)
+        ok(f"removed {before - len(data['rules'])} rule(s)")
+
+    elif args.action in ("enable", "disable"):
+        if not args.id:
+            die("pass a rule id, or `all`")
+        want = args.action == "enable"
+        n = 0
+        for r in rules:
+            if "all" in args.id or r.get("id") in args.id:
+                r["enabled"] = want
+                n += 1
+        write_rules(data)
+        ok(f"{args.action}d {n} rule(s)")
+
+    elif args.action == "clear":
+        data["rules"] = []
+        write_rules(data)
+        ok("all rules removed")
+
+    elif args.action == "capture":
+        if args.json:
+            data["capture"] = json.loads(args.json)
+            write_rules(data)
+        print(json.dumps(data.get("capture", {}), indent=2))
+
+
+VALID_ACTIONS = {
+    "map_local", "map_remote", "block", "delay", "status",
+    "set_header", "body_replace", "json_patch",
+}
+
+
+def _validate_rule(rule):
+    if not rule.get("match"):
+        die(f"rule {rule.get('id')} has no `match` block")
+    actions = _as_list(rule.get("action") or rule.get("actions") or [])
+    if not actions:
+        die(f"rule {rule.get('id')} has no `action`")
+    for a in actions:
+        kind = a.get("type")
+        if kind not in VALID_ACTIONS:
+            die(f"unknown action type {kind!r}. Valid: {', '.join(sorted(VALID_ACTIONS))}")
+        if kind == "map_local":
+            p = Path(a.get("file", ""))
+            p = p if p.is_absolute() else ROOT / p
+            if not p.exists():
+                die(f"map_local file does not exist: {p}")
+
+
+# ------------------------------------------------------------------ extras
+
+def cmd_replay(cfg, args):
+    """Send a captured request again, through the proxy, so rules apply."""
+    flows = {str(f.get("id")): f for f in _read_flows()}
+    f = flows.get(str(args.id))
+    if not f:
+        die(f"no flow with id {args.id}")
+    if not read_pid():
+        die("proxy is not running")
+    body = None
+    path = f.get("req_body_file")
+    if path and (ROOT / path).exists():
+        body = (ROOT / path).read_bytes()
+    req = urllib.request.Request(f["url"], data=body, method=f.get("method", "GET"))
+    skip = {"host", "content-length", "accept-encoding", "connection"}
+    for k, v in (f.get("req_headers") or {}).items():
+        if k.lower() not in skip:
+            req.add_header(k, v)
+    proxy = f"http://127.0.0.1:{cfg['port']}"
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    import ssl
+    ctx = ssl.create_default_context(cafile=str(CA_PEM)) if CA_PEM.exists() else None
+    if ctx:
+        opener.add_handler(urllib.request.HTTPSHandler(context=ctx))
+    try:
+        with opener.open(req, timeout=args.timeout) as resp:
+            print(f"{resp.status} {resp.reason}  {len(resp.read())} bytes")
+    except urllib.error.HTTPError as exc:
+        print(f"{exc.code} {exc.reason}  {len(exc.read())} bytes")
+    except (urllib.error.URLError, OSError) as exc:
+        die(f"replay failed: {exc}")
+    ok("replayed. The new flow is at the end of `proxyctl flows`.")
+
+
+def cmd_har(cfg, args):
+    if not DUMP_FILE.exists():
+        die("no raw flow dump yet. Capture some traffic first.")
+    out = Path(args.out).expanduser().resolve()
+    res = subprocess.run(
+        [cfg["mitmdump"], "-nr", str(DUMP_FILE), "--set", f"hardump={out}", "-q"],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0 or not out.exists():
+        die(f"HAR export failed: {(res.stderr or res.stdout).strip()}")
+    ok(f"HAR written to {out}")
+
+
+def require_package(cfg):
+    pkg = cfg.get("package")
+    if not pkg:
+        die('no app package set. Add "package": "com.your.app" to config.json '
+            "(copy config.example.json if you have not yet).")
+    return pkg
+
+
+def main_activity(cfg, pkg):
+    """Resolve the launcher activity of a package.
+
+    Debug builds of this app ship LeakCanary, which registers its own launcher
+    activity. `monkey` then starts LeakCanary instead of the app, and no
+    backend traffic ever appears. So pick the real activity explicitly.
+    """
+    if cfg.get("main_activity"):
+        return cfg["main_activity"]
+    out = adb(cfg, "shell", "cmd", "package", "query-activities", "--brief",
+              "-a", "android.intent.action.MAIN",
+              "-c", "android.intent.category.LAUNCHER").stdout or ""
+    hits = [
+        line.strip() for line in out.splitlines()
+        if line.strip().startswith(f"{pkg}/") and "leakcanary" not in line.lower()
+    ]
+    if not hits:
+        return None
+    cfg["main_activity"] = hits[0]
+    save_config(cfg)
+    return hits[0]
+
+
+def start_app(cfg, pkg):
+    comp = main_activity(cfg, pkg)
+    if comp:
+        adb(cfg, "shell", "am", "start", "-n", comp, check=True)
+        return comp
+    adb(cfg, "shell", "monkey", "-p", pkg, "-c",
+        "android.intent.category.LAUNCHER", "1", check=True)
+    return f"{pkg} (via monkey)"
+
+
+def cmd_app(cfg, args):
+    pkg = args.package or require_package(cfg)
+    ensure_reverse(cfg)
+    if args.action in ("restart", "stop"):
+        adb(cfg, "shell", "am", "force-stop", pkg, check=True)
+        ok(f"stopped {pkg}")
+    if args.action in ("restart", "start"):
+        time.sleep(0.8)
+        ok(f"started {start_app(cfg, pkg)}")
+
+
+def read_web_pid():
+    if not WEB_PID_FILE.exists():
+        return None
+    try:
+        pid = int(WEB_PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def cmd_web(cfg, args):
+    """Serve the live dashboard: a flow list next to a detail inspector.
+
+    A plain static file server is enough. The dashboard page polls
+    var/flows.jsonl and rules/rules.json itself, so this process only needs to
+    serve files from ROOT, same-origin, so those fetches are not blocked.
+    """
+    port = cfg["dashboard_port"]
+    url = f"http://127.0.0.1:{port}/webui/"
+
+    if args.action == "status":
+        pid = read_web_pid()
+        print(f"{C['bold']}dashboard{C['off']}  " + (
+            f"{C['green']}running{C['off']} pid {pid}  {url}" if pid
+            else f"{C['red']}stopped{C['off']}"
+        ))
+        return
+
+    if args.action == "off":
+        pid = read_web_pid()
+        if not pid:
+            warn("dashboard is not running")
+            WEB_PID_FILE.unlink(missing_ok=True)
+            return
+        os.kill(pid, signal.SIGTERM)
+        WEB_PID_FILE.unlink(missing_ok=True)
+        ok("dashboard stopped")
+        return
+
+    # action == "on"
+    if read_web_pid():
+        ok(f"dashboard already running at {url}")
+        return
+    with WEB_LOG_FILE.open("a") as logfh:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port),
+             "--bind", "127.0.0.1", "--directory", str(ROOT)],
+            stdout=logfh, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        die(f"the dashboard server did not start. See {WEB_LOG_FILE}")
+    WEB_PID_FILE.write_text(str(proc.pid))
+    ok(f"dashboard at {url}")
+    print(f"  It polls var/flows.jsonl once a second. No refresh needed.")
+    if args.open:
+        subprocess.run(["open", url])
+
+
+def cmd_setup(cfg, args):
+    """One command that gets everything ready."""
+    info("step 1/4 start the proxy")
+    cmd_start(cfg, argparse.Namespace(port=None, web=False, insecure=False, upstream=None))
+    info("step 2/4 point the device at the proxy")
+    cmd_device(cfg, argparse.Namespace(action="on", lan=None))
+    info("step 3/4 install the CA certificate")
+    _cert_user(cfg)
+    info("step 4/4 after the taps above, run `proxyctl cert verify`")
+
+
+def cmd_mock(cfg, args):
+    """Shortcut: capture a real response, save it, and serve it locally."""
+    flows = {str(f.get("id")): f for f in _read_flows()}
+    f = flows.get(str(args.id))
+    if not f:
+        die(f"no flow with id {args.id}")
+    src = f.get("resp_body_file")
+    if not src or not (ROOT / src).exists():
+        die(f"flow {args.id} has no saved response body to seed the mock")
+    name = args.name or (re.sub(r"[^a-zA-Z0-9]+", "_", f.get("path", "mock")).strip("_") or "mock")
+    ext = Path(src).suffix or ".json"
+    target = MAPS / f"{name}{ext}"
+    target.write_bytes((ROOT / src).read_bytes())
+    rule = {
+        "id": args.rule_id or f"mock_{name}"[:40],
+        "name": f"map local for {f.get('path')}",
+        "enabled": True,
+        "match": {"host": re.escape(f.get("host", "")), "path": f"^{re.escape(f.get('path',''))}"},
+        "action": {
+            "type": "map_local",
+            "file": str(target.relative_to(ROOT)),
+            "status": f.get("status") or 200,
+            "content_type": f.get("resp_type") or "application/json",
+        },
+    }
+    data = read_rules()
+    data.setdefault("rules", [])
+    data["rules"] = [r for r in data["rules"] if r.get("id") != rule["id"]]
+    data["rules"].append(rule)
+    write_rules(data)
+    ok(f"mock body at {target}")
+    ok(f"rule {rule['id']} added. Edit the file, then reload the screen in the app.")
+
+
+# --------------------------------------------------------------------- cli
+
+def main():
+    cfg = load_config()
+    p = argparse.ArgumentParser(prog="proxyctl", description=__doc__,
+                               formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("start", help="start the proxy")
+    sp.add_argument("--port", type=int)
+    sp.add_argument("--web", action="store_true", help="also serve the mitmweb UI")
+    sp.add_argument("--insecure", action="store_true", help="do not verify upstream TLS")
+    sp.add_argument("--upstream", help="chain to another proxy, host:port")
+    sp.set_defaults(fn=cmd_start)
+
+    for name, fn in (("stop", cmd_stop), ("status", cmd_status)):
+        s = sub.add_parser(name, help=f"{name} the proxy")
+        s.set_defaults(fn=fn)
+
+    sp = sub.add_parser("restart", help="restart the proxy")
+    sp.add_argument("--port", type=int)
+    sp.add_argument("--web", action="store_true")
+    sp.add_argument("--insecure", action="store_true")
+    sp.add_argument("--upstream")
+    sp.set_defaults(fn=cmd_restart)
+
+    sp = sub.add_parser("setup", help="start, wire the device, install the certificate")
+    sp.set_defaults(fn=cmd_setup)
+
+    sp = sub.add_parser("web", help="serve the live dashboard (flow list + inspector)")
+    sp.add_argument("action", nargs="?", default="on", choices=["on", "off", "status"])
+    sp.add_argument("--open", action="store_true", help="open it in the default browser")
+    sp.set_defaults(fn=cmd_web)
+
+    sp = sub.add_parser("device", help="route device traffic through the proxy")
+    sp.add_argument("action", choices=["on", "off"])
+    sp.add_argument("--lan", nargs="?", const=True,
+                    help="use the Mac LAN IP instead of adb reverse")
+    sp.set_defaults(fn=cmd_device)
+
+    sp = sub.add_parser("cert", help="install the mitmproxy CA on the device")
+    sp.add_argument("mode", nargs="?", default="user",
+                    choices=["user", "system", "path", "verify"])
+    sp.add_argument("--wait", type=int, default=25)
+    sp.set_defaults(fn=lambda c, a: cmd_cert_verify(c, a) if a.mode == "verify" else cmd_cert(c, a))
+
+    sp = sub.add_parser("flows", help="list captured traffic")
+    sp.add_argument("--last", type=int, default=40)
+    sp.add_argument("--host"); sp.add_argument("--url"); sp.add_argument("--method")
+    sp.add_argument("--status"); sp.add_argument("--grep")
+    sp.add_argument("--min-ms", type=int, dest="min_ms")
+    sp.add_argument("--errors", action="store_true", help="only failed flows")
+    sp.add_argument("--mocked", action="store_true", help="only flows a rule touched")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_flows)
+
+    sp = sub.add_parser("show", help="show one flow in full")
+    sp.add_argument("id")
+    sp.add_argument("--full", action="store_true", help="print whole bodies")
+    sp.add_argument("--body-only", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_show)
+
+    sp = sub.add_parser("body", help="print the path of a saved body file")
+    sp.add_argument("id"); sp.add_argument("side", choices=["req", "resp"])
+    sp.set_defaults(fn=cmd_body)
+
+    sp = sub.add_parser("clear", help="delete the flow log and saved bodies")
+    sp.set_defaults(fn=cmd_clear)
+
+    sp = sub.add_parser("tail", help="follow new flows live")
+    sp.set_defaults(fn=cmd_tail)
+
+    sp = sub.add_parser("rules", help="manage interception rules")
+    sp.add_argument("action", choices=["list", "add", "rm", "remove", "enable",
+                                      "disable", "clear", "capture"])
+    sp.add_argument("id", nargs="*")
+    sp.add_argument("--json", help="rule JSON, or read from stdin")
+    sp.set_defaults(fn=cmd_rules)
+
+    sp = sub.add_parser("mock", help="turn a captured response into a map-local rule")
+    sp.add_argument("id")
+    sp.add_argument("--name"); sp.add_argument("--rule-id")
+    sp.set_defaults(fn=cmd_mock)
+
+    sp = sub.add_parser("replay", help="send a captured request again")
+    sp.add_argument("id"); sp.add_argument("--timeout", type=int, default=30)
+    sp.set_defaults(fn=cmd_replay)
+
+    sp = sub.add_parser("har", help="export captured traffic as HAR")
+    sp.add_argument("out")
+    sp.set_defaults(fn=cmd_har)
+
+    sp = sub.add_parser("app", help="start or stop the app under test")
+    sp.add_argument("action", choices=["start", "stop", "restart"])
+    sp.add_argument("--package")
+    sp.set_defaults(fn=cmd_app)
+
+    args = p.parse_args()
+    if not getattr(args, "fn", None):
+        p.print_help()
+        return
+    args.fn(cfg, args)
+
+
+if __name__ == "__main__":
+    main()

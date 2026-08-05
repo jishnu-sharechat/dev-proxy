@@ -1,0 +1,20 @@
+# Captured traffic. Never commit this.
+# Real flows carry live session cookies and auth tokens from whatever device
+# you were pointing at the proxy. Treat var/ as radioactive.
+var/
+
+# Local machine config: absolute paths, port choices, generated web password.
+# Copy config.example.json instead.
+config.json
+
+# Your own mock payloads. Keep the folder, drop the contents.
+maps/*
+!maps/README.md
+
+# Editor and OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+__pycache__/
+*.pyc
