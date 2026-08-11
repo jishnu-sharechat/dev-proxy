@@ -9,6 +9,8 @@ Run `proxyctl help` for the command list.
 """
 
 import argparse
+import functools
+import http.server
 import json
 import os
 import re
@@ -657,20 +659,24 @@ def cmd_body(cfg, args):
     print(ROOT / path)
 
 
-def cmd_clear(cfg, args):
+def _clear_flows():
     FLOWS_FILE.unlink(missing_ok=True)
     for p in BODIES.glob("*"):
         if p.is_file():
             p.unlink()
-    ok("flow log and saved bodies cleared. Ids restart at 1.")
     # The running mitmdump holds var/flows.mitm open. Deleting it here would
     # send every later write to an unlinked inode and break `proxyctl har`.
     # A restart reopens the file, so only reset it when the proxy is down.
+    if not read_pid():
+        DUMP_FILE.unlink(missing_ok=True)
+
+
+def cmd_clear(cfg, args):
+    _clear_flows()
+    ok("flow log and saved bodies cleared. Ids restart at 1.")
     if read_pid():
         warn("the raw dump (for `proxyctl har`) still covers this whole proxy run. "
              "Run `proxyctl restart` first if you need a clean HAR.")
-    else:
-        DUMP_FILE.unlink(missing_ok=True)
 
 
 def cmd_tail(cfg, args):
@@ -909,12 +915,71 @@ def read_web_pid():
     return pid
 
 
+DASHBOARD_ROUTES = {
+    "/api/clear": lambda body: (_clear_flows(), {"ok": True})[1],
+}
+
+
+def _dashboard_same_origin(handler):
+    """True unless the browser explicitly flags this as a cross-site request.
+
+    A malicious page open in another tab could otherwise POST to this
+    loopback-only, unauthenticated server and silently wipe local state.
+    Sec-Fetch-Site is sent by every evergreen browser on fetch(); direct
+    curl/script use sends no such header and is allowed through unchanged.
+    """
+    site = handler.headers.get("Sec-Fetch-Site")
+    return site is None or site == "same-origin"
+
+
+def _make_dashboard_handler():
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            pass  # proxyctl web redirects this process's stdout/stderr to WEB_LOG_FILE already
+
+        def do_POST(self):
+            route = DASHBOARD_ROUTES.get(self.path)
+            if route is None:
+                self.send_error(404)
+                return
+            if not _dashboard_same_origin(self):
+                self.send_error(403, "cross-origin request rejected")
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b""
+            try:
+                result = route(body)
+                status = 200
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+                status = 500
+            payload = json.dumps(result).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    return functools.partial(Handler, directory=str(ROOT))
+
+
+def cmd_serve_dashboard(cfg, args):
+    """Internal: run the dashboard's HTTP server in the foreground.
+
+    `web on` spawns this as a detached subprocess — it is not meant to be run
+    directly, which is why it is hidden from `proxyctl help`.
+    """
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), _make_dashboard_handler())
+    server.serve_forever()
+
+
 def cmd_web(cfg, args):
     """Serve the live dashboard: a flow list next to a detail inspector.
 
-    A plain static file server is enough. The dashboard page polls
-    var/flows.jsonl and rules/rules.json itself, so this process only needs to
-    serve files from ROOT, same-origin, so those fetches are not blocked.
+    The dashboard page polls var/flows.jsonl and rules/rules.json itself, and
+    posts to a couple of small JSON routes (see DASHBOARD_ROUTES) for actions
+    that need to touch state on disk — everything else is served as a plain
+    static file, same-origin, so those fetches are not blocked.
     """
     port = cfg["dashboard_port"]
     url = f"http://127.0.0.1:{port}/webui/"
@@ -944,8 +1009,7 @@ def cmd_web(cfg, args):
         return
     with WEB_LOG_FILE.open("a") as logfh:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "http.server", str(port),
-             "--bind", "127.0.0.1", "--directory", str(ROOT)],
+            [sys.executable, str(Path(__file__).resolve()), "_serve", str(port)],
             stdout=logfh, stderr=subprocess.STDOUT, start_new_session=True,
         )
     time.sleep(0.5)
@@ -1036,6 +1100,10 @@ def main():
     sp.add_argument("action", nargs="?", default="on", choices=["on", "off", "status"])
     sp.add_argument("--open", action="store_true", help="open it in the default browser")
     sp.set_defaults(fn=cmd_web)
+
+    sp = sub.add_parser("_serve", help=argparse.SUPPRESS)
+    sp.add_argument("port", type=int)
+    sp.set_defaults(fn=cmd_serve_dashboard)
 
     sp = sub.add_parser("device", help="route device traffic through the proxy")
     sp.add_argument("action", choices=["on", "off"])
