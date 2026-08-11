@@ -159,6 +159,7 @@
     <option value="mock">rule-touched</option>
   </select>
   <label><input type="checkbox" id="fAutoscroll" checked> follow newest</label>
+  <button id="btnReset">reset filters</button>
   <button id="btnClear">clear</button>
   <div class="rulebar" id="ruleBar">loading rules…</div>
 </div>
@@ -346,6 +347,13 @@ if (location.hash) {
 }
 
 ["fHost", "fUrl", "fStatus"].forEach(id => $("#" + id).addEventListener("input", renderRows));
+
+$("#btnReset").addEventListener("click", () => {
+  $("#fHost").value = "";
+  $("#fUrl").value = "";
+  $("#fStatus").value = "";
+  renderRows();
+});
 
 $("#btnClear").addEventListener("click", async () => {
   if (!confirm("Clear all captured flows? This cannot be undone.")) return;
