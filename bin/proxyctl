@@ -118,9 +118,13 @@ def adb(cfg, *args, check=False, capture=True, serial=None):
     if serial:
         cmd += ["-s", serial]
     cmd += [str(a) for a in args]
-    res = subprocess.run(
-        cmd, capture_output=capture, text=True, check=False
-    )
+    try:
+        res = subprocess.run(
+            cmd, capture_output=capture, text=True, check=False
+        )
+    except FileNotFoundError:
+        die(f"adb not found ({cfg['adb']!r}). Install it: "
+            "brew install --cask android-platform-tools")
     if check and res.returncode != 0:
         die(f"adb {' '.join(str(a) for a in args)} failed: {(res.stderr or res.stdout).strip()}")
     return res

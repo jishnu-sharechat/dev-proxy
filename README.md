@@ -94,10 +94,10 @@ cd dev-proxy
 ./install.sh                    # symlinks proxyctl, installs the Claude skill
 ```
 
-Then point it at your app:
+`install.sh` creates `config.json` for you if it doesn't already exist. Point
+it at your app — set `"package"` in `config.json` to your app id — then:
 
 ```bash
-cp config.example.json config.json     # set "package" to your app id
 proxyctl start
 proxyctl device on                     # adb reverse + set the device proxy
 proxyctl cert                          # pushes the CA, opens the installer
