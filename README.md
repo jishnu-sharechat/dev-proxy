@@ -18,6 +18,12 @@ Reload the screen on your phone. The feed is empty. No restart, no rebuild.
 Charles and Proxyman are excellent. They are also **mouse-driven**, and that is
 the whole problem.
 
+They also carry real, everyday friction of their own: Charles only intercepts
+once your Mac and phone share a network, needs a license key past the trial,
+and has a habit of getting silently stuck mid-session. dev-proxy runs over the
+same USB cable `adb` already uses — no network requirement, no license, and if
+it ever wedges, `proxyctl restart` is one command away.
+
 Once you start pairing with a coding agent, the workflow breaks in a specific
 way. You can ask the agent to change code. You cannot ask it to *see what the
 app actually sent*, or to *make the API return an empty list so we can check the
@@ -289,8 +295,12 @@ Collected the hard way. Most of these cost real debugging time.
 
 ## The Claude Code skill
 
-`skill/SKILL.md` teaches Claude Code to drive all of this. `./install.sh` puts it
-in `~/.claude/skills/dev-proxy/`.
+This isn't an MCP server — there's no extra process or protocol to run. It's a
+[Claude Code Skill](https://code.claude.com/docs/en/skills): a
+markdown file, `skill/SKILL.md`, that teaches Claude which `proxyctl` commands
+to run and how to read the two data files above. `./install.sh` generates it
+into `~/.claude/skills/dev-proxy/`. Claude ends up running the exact same CLI
+you would by hand — it just knows the recipes.
 
 After that, this kind of thing works:
 
