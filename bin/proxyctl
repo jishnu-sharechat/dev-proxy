@@ -325,7 +325,16 @@ def cmd_device(cfg, args):
                     "global_http_proxy_exclusion_list"):
             adb(cfg, "shell", "settings", "delete", "global", key)
         adb(cfg, "reverse", "--remove", f"tcp:{port}")
-        ok("device proxy removed")
+        proxy = (adb(cfg, "shell", "settings", "get", "global",
+                     "http_proxy").stdout or "").strip()
+        rev = adb(cfg, "reverse", "--list").stdout or ""
+        left = f"tcp:{port}" in rev
+        if proxy not in ("null", "") or left:
+            warn(f"device still shows http_proxy={proxy or 'unset'}"
+                 + (f", reverse tunnel tcp:{port} still active" if left else "")
+                 + ". Clear by hand: adb shell settings delete global http_proxy")
+        else:
+            ok("device proxy removed and verified clear")
 
 
 def ensure_reverse(cfg, quiet=False):
