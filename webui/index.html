@@ -80,8 +80,28 @@
     border-radius: 5px; padding: 5px 10px; font-size: 12px; font-family: inherit; cursor: pointer;
   }
   .filters button:hover { background: var(--row-hover); }
-  .rulebar { font-size: 11.5px; color: var(--text-muted); padding-left: 8px; border-left: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .rulebar b { color: var(--text); }
+  .rulebar-wrap { position: relative; }
+  .rulebar {
+    font-size: 11.5px; color: var(--text-muted); padding-left: 8px; border-left: 1px solid var(--border);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; max-width: 260px;
+  }
+  .rulebar:hover { color: var(--text); }
+  .rules-panel {
+    display: none; position: absolute; top: 100%; right: 0; margin-top: 6px; z-index: 10;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, .25); padding: 6px; min-width: 260px; max-width: 380px;
+    max-height: 320px; overflow-y: auto;
+  }
+  .rules-panel.open { display: block; }
+  .rules-panel .rule-row {
+    display: flex; align-items: center; gap: 8px; padding: 6px 4px; font-size: 12px;
+    border-bottom: 1px solid var(--border); cursor: pointer;
+  }
+  .rules-panel .rule-row:last-child { border-bottom: none; }
+  .rules-panel .rule-row.disabled { opacity: .5; }
+  .rules-panel .rule-id { font-weight: 600; flex: 1; word-break: break-all; }
+  .rules-panel .rule-kind { color: var(--text-muted); font-size: 10.5px; }
+  .rules-panel .empty { padding: 10px 4px; color: var(--text-dim); text-align: center; font-size: 12px; }
 
   main { flex: 1; display: flex; min-height: 0; }
   .list { flex: 1.3; min-width: 0; overflow-y: auto; border-right: 1px solid var(--border); }
@@ -160,7 +180,10 @@
   </select>
   <label><input type="checkbox" id="fAutoscroll" checked> follow newest</label>
   <button id="btnClear">clear</button>
-  <div class="rulebar" id="ruleBar">loading rules…</div>
+  <div class="rulebar-wrap">
+    <div class="rulebar" id="ruleBar">loading rules…</div>
+    <div class="rules-panel" id="rulesPanel"></div>
+  </div>
 </div>
 
 <main>
@@ -231,12 +254,28 @@ function matchesFilters(f) {
   return true;
 }
 
+function ruleActionKinds(r) {
+  const actions = r.action ? [r.action] : (r.actions || []);
+  return actions.map(a => a && a.type).filter(Boolean).join(", ") || "?";
+}
+
 function renderRules() {
-  const active = (rulesData.rules || []).filter(r => r.enabled !== false);
+  const rules = rulesData.rules || [];
+  const active = rules.filter(r => r.enabled !== false);
   const bar = $("#ruleBar");
-  if (!active.length) { bar.innerHTML = "no active rules"; return; }
-  bar.innerHTML = "<b>" + active.length + " active rule" + (active.length > 1 ? "s" : "") + "</b> — "
-    + active.map(r => esc(r.id)).join(", ");
+  bar.textContent = rules.length
+    ? `${active.length} active / ${rules.length} total rule${rules.length > 1 ? "s" : ""} ▾`
+    : "no rules ▾";
+
+  const panel = $("#rulesPanel");
+  panel.innerHTML = rules.length ? rules.map(r => {
+    const enabled = r.enabled !== false;
+    return `<label class="rule-row${enabled ? "" : " disabled"}">
+      <input type="checkbox" class="ruleToggle" data-id="${esc(r.id)}" ${enabled ? "checked" : ""}>
+      <span class="rule-id">${esc(r.id)}</span>
+      <span class="rule-kind">${esc(ruleActionKinds(r))}</span>
+    </label>`;
+  }).join("") : `<div class="empty">no rules defined</div>`;
 }
 
 function renderStats() {
@@ -359,6 +398,36 @@ $("#btnClear").addEventListener("click", async () => {
     renderRows();
   } catch (e) {
     alert("Could not clear flows: " + e.message);
+  }
+});
+
+$("#ruleBar").addEventListener("click", (e) => {
+  e.stopPropagation();
+  $("#rulesPanel").classList.toggle("open");
+});
+
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".rulebar-wrap")) $("#rulesPanel").classList.remove("open");
+});
+
+$("#rulesPanel").addEventListener("change", async (e) => {
+  const cb = e.target.closest(".ruleToggle");
+  if (!cb) return;
+  const id = cb.dataset.id;
+  const enabled = cb.checked;
+  try {
+    const res = await fetch("/api/rules/toggle", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id, enabled}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const rule = (rulesData.rules || []).find(r => r.id === id);
+    if (rule) rule.enabled = enabled;
+    renderRules();
+  } catch (err) {
+    cb.checked = !enabled;
+    alert("Could not update rule: " + err.message);
   }
 });
 

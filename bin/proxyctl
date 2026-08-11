@@ -718,6 +718,17 @@ def write_rules(data):
     tmp.replace(RULES_FILE)
 
 
+def _toggle_rule(rule_id, enabled):
+    """Enable/disable one rule by id. Returns False if the id doesn't exist."""
+    data = read_rules()
+    match = next((r for r in data.get("rules", []) if r.get("id") == rule_id), None)
+    if match is None:
+        return False
+    match["enabled"] = enabled
+    write_rules(data)
+    return True
+
+
 def _as_list(v):
     return v if isinstance(v, list) else [v]
 
@@ -915,8 +926,31 @@ def read_web_pid():
     return pid
 
 
+class DashboardRouteError(Exception):
+    """A route's way of asking for a specific HTTP status, e.g. 404 for an
+    unknown id, rather than the generic 500 an unexpected exception gets."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+def _route_toggle_rule(body):
+    try:
+        payload = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        raise DashboardRouteError(400, "malformed JSON body")
+    rule_id, enabled = payload.get("id"), payload.get("enabled")
+    if not rule_id or not isinstance(enabled, bool):
+        raise DashboardRouteError(400, 'expected {"id": str, "enabled": bool}')
+    if not _toggle_rule(rule_id, enabled):
+        raise DashboardRouteError(404, f"unknown rule id {rule_id!r}")
+    return {"ok": True}
+
+
 DASHBOARD_ROUTES = {
     "/api/clear": lambda body: (_clear_flows(), {"ok": True})[1],
+    "/api/rules/toggle": _route_toggle_rule,
 }
 
 
@@ -950,6 +984,9 @@ def _make_dashboard_handler():
             try:
                 result = route(body)
                 status = 200
+            except DashboardRouteError as exc:
+                result = {"ok": False, "error": str(exc)}
+                status = exc.status
             except Exception as exc:
                 result = {"ok": False, "error": str(exc)}
                 status = 500
