@@ -207,8 +207,11 @@ let flows = [], rulesData = {rules: [], capture: {}}, selectedId = null, lastGoo
 // came in, which looked like the panel was glitching while they were reading.
 let renderedDetailId = null;
 
-async function fetchText(path) {
+async function fetchText(path, optional = false) {
   const res = await fetch(path + "?t=" + Date.now(), {cache: "no-store"});
+  // A missing optional file is a normal state, not a dead server: right
+  // after a clear, var/flows.jsonl does not exist until the next flow lands.
+  if (res.status === 404 && optional) return "";
   if (!res.ok) throw new Error(res.status);
   return res.text();
 }
@@ -345,8 +348,11 @@ async function renderDetail(f) {
   if (f.mocked) badges += `<span class="badge mock">served locally</span>`;
 
   let why = "";
+  if (f.mapped_to) {
+    why += `<div class="why"><b>Mapped to another target</b>${esc(f.mapped_to)}</div>`;
+  }
   if (f.rules && f.rules.length) {
-    why = `<div class="why"><b>Rules applied to this flow</b>${f.rules.map(esc).join(", ")}</div>`;
+    why += `<div class="why"><b>Rules applied to this flow</b>${f.rules.map(esc).join(", ")}</div>`;
   }
   if (f.error) {
     why += `<div class="why" style="background:color-mix(in srgb, var(--bad) 14%, transparent); color:var(--bad)"><b>Error</b>${esc(f.error)}${f.hint ? "<br>" + esc(f.hint) : ""}</div>`;
@@ -442,7 +448,7 @@ $("#rulesPanel").addEventListener("change", async (e) => {
 async function tick() {
   try {
     const [flowText, rulesText] = await Promise.all([
-      fetchText("../var/flows.jsonl"),
+      fetchText("../var/flows.jsonl", true),
       fetchText("../rules/rules.json"),
     ]);
     flows = parseJsonl(flowText);

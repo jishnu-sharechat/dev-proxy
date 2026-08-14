@@ -48,6 +48,15 @@ class H(http.server.BaseHTTPRequestHandler):
     def go(self):
         n = int(self.headers.get("content-length") or 0)
         raw = self.rfile.read(n) if n else b""
+        if self.path.startswith("/badbytes"):
+            # Invalid UTF-8 in a "textual" content type. The recorder must
+            # survive this (issue #16).
+            b = b'{"msg": "\xd0\x28 not utf-8"}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(b)))
+            self.end_headers(); self.wfile.write(b)
+            return
         out = json.loads(json.dumps(BODY))
         out.update(path=self.path, got=raw.decode(errors="replace"),
                    seen=self.headers.get("x-injected", ""))
@@ -178,6 +187,42 @@ print('ok')" 2>&1)"
 # 15. a refused patch is visible in the flow tag
 check "NOT_APPLIED is recorded" "NOT_APPLIED" \
   "$(grep -o 'NOT_APPLIED' "$WORK/var/flows.jsonl" | head -1)"
+
+# 16. map_remote to an excluded host still records the flow (issue #15)
+rules '{"capture":{"exclude_hosts":["^127\\.0\\.0\\.1$"]},
+  "rules":[{"id":"mr","match":{"host":"testhost\\.devproxy"},
+  "action":{"type":"map_remote","host":"127.0.0.1","port":'$SRV_PORT',"scheme":"http"}}]}'
+check "map_remote reaches the target" '"path": "/mapped"' "$(p http://testhost.devproxy/mapped)"
+sleep 1
+LOGLINE="$(grep '/mapped' "$WORK/var/flows.jsonl" | tail -1)"
+check "flow kept the original host"  '"host": "testhost.devproxy"' "$LOGLINE"
+check "flow records mapped_to"       '"mapped_to": "http://127.0.0.1:'$SRV_PORT'/mapped"' "$LOGLINE"
+rules '{"capture":{},"rules":[]}'
+
+# 17. a body with invalid UTF-8 must not drop the flow (issue #16)
+check "bad-bytes body passes through" "not utf-8" "$(p $BASE/badbytes | LC_ALL=C tr -c '[:print:]' '?')"
+sleep 1
+check "bad-bytes flow is recorded" '"path": "/badbytes"' \
+  "$(grep '/badbytes' "$WORK/var/flows.jsonl" | tail -1)"
+check "bad-bytes body file saved" "badbytes" \
+  "$(python3 -c "
+import json,pathlib
+line=[l for l in pathlib.Path('$WORK/var/flows.jsonl').read_text().splitlines() if '/badbytes' in l][-1]
+f=json.loads(line)
+p=pathlib.Path('$WORK')/f['resp_body_file']
+print('badbytes' if p.exists() else 'missing:'+str(p))" 2>&1)"
+
+# 18. ids stay unique through a burst right after a clear (issue #17)
+rm -f "$WORK/var/flows.jsonl"
+for i in $(seq 1 10); do p -o /dev/null "$BASE/burst?i=$i" & done
+wait
+sleep 1
+check "ids unique after clear + burst" "unique" \
+  "$(python3 -c "
+import json,pathlib
+ids=[json.loads(l)['id'] for l in pathlib.Path('$WORK/var/flows.jsonl').read_text().splitlines() if l.strip()]
+burst=[json.loads(l)['id'] for l in pathlib.Path('$WORK/var/flows.jsonl').read_text().splitlines() if 'burst' in l]
+print('unique' if len(ids)==len(set(ids)) and len(burst)==10 and min(burst)==1 else f'dupes or missing: {sorted(ids)}')" 2>&1)"
 
 echo
 if [[ $FAIL -eq 0 ]]; then

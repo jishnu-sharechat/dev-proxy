@@ -196,6 +196,11 @@ class DevProxy:
     def __init__(self):
         self.cfg = Config()
         self.counter = self._last_id()
+        # True while the id sequence has been reset for a missing flow log and
+        # no entry has been written yet. Guards against a burst of requests
+        # right after `proxyctl clear` each resetting the counter again, which
+        # handed the same id to several flows.
+        self._id_reset_done = False
         VAR.mkdir(parents=True, exist_ok=True)
         BODIES.mkdir(parents=True, exist_ok=True)
 
@@ -239,10 +244,22 @@ class DevProxy:
         if not FLOWS_FILE.exists():
             # `proxyctl clear` removed the log. Restart the id sequence so ids
             # stay short, and so they line up with the body files on disk.
-            self.counter = 0
+            # Reset once per clear: the file only reappears with the first
+            # recorded response, and every request that raced it would reset
+            # the counter again and duplicate ids.
+            if not self._id_reset_done:
+                self.counter = 0
+                self._id_reset_done = True
+        else:
+            self._id_reset_done = False
         self.counter += 1
         flow.metadata["dp_id"] = self.counter
         flow.metadata["dp_rules"] = []
+        # Keep what the app actually called. map_remote rewrites the request
+        # host/url in place, and the record step must not judge capture
+        # exclusions (or display) by the rewritten target.
+        flow.metadata["dp_original_host"] = flow.request.pretty_host
+        flow.metadata["dp_original_url"] = flow.request.pretty_url
 
         for rule in self.cfg.rules:
             if not _match(rule, flow):
@@ -477,7 +494,7 @@ class DevProxy:
         flow.metadata["dp_recorded"] = True
 
         cap = self.cfg.capture
-        host = flow.request.pretty_host
+        host = flow.metadata.get("dp_original_host") or flow.request.pretty_host
         for pattern in cap.get("exclude_hosts") or []:
             if _one_match(pattern, host):
                 return
@@ -494,6 +511,11 @@ class DevProxy:
         req_ct = req.headers.get("content-type", "")
         resp_ct = resp.headers.get("content-type", "") if resp else ""
 
+        # Log the URL the app called. When map_remote sent the request
+        # somewhere else, surface that target separately as `mapped_to`.
+        original_url = flow.metadata.get("dp_original_url") or req.pretty_url
+        mapped_to = req.pretty_url if req.pretty_url != original_url else None
+
         entry = {
             "id": fid,
             "ts": round(req.timestamp_start or time.time(), 3),
@@ -505,7 +527,8 @@ class DevProxy:
             "host": host,
             "path": req.path.split("?")[0],
             "query": dict(req.query) or None,
-            "url": req.pretty_url,
+            "url": original_url,
+            "mapped_to": mapped_to,
             "duration_ms": None,
             "req_type": req_ct.split(";")[0] or None,
             "resp_type": resp_ct.split(";")[0] or None,
@@ -543,10 +566,7 @@ class DevProxy:
             return None, None
         preview = None
         if _is_textual(content_type):
-            try:
-                text = message.get_text(strict=False) or ""
-            except ValueError:
-                text = ""
+            text = self._safe_text(message)
             preview = text[:PREVIEW_CHARS]
             if len(text) > PREVIEW_CHARS:
                 preview += f"... [{len(text)} chars total]"
@@ -559,7 +579,7 @@ class DevProxy:
             target = BODIES / f"{fid:06d}.{side}.{ext}"
             try:
                 if _is_textual(content_type):
-                    body = message.get_text(strict=False) or ""
+                    body = self._safe_text(message)
                     if "json" in (content_type or "").lower():
                         try:
                             body = json.dumps(json.loads(body), indent=2)
@@ -569,9 +589,25 @@ class DevProxy:
                 else:
                     target.write_bytes(raw)
                 path = str(target.relative_to(ROOT))
-            except OSError as exc:
+            except (OSError, UnicodeError) as exc:
                 log.error("dev-proxy: cannot write body: %s", exc)
         return preview, path
+
+    @staticmethod
+    def _safe_text(message) -> str:
+        """Body text with no lone surrogates.
+
+        get_text(strict=False) decodes invalid UTF-8 with surrogateescape.
+        Those surrogates cannot be encoded back to UTF-8, so one bad byte in
+        one body crashed the file write and dropped the whole flow from the
+        log (issue #16). Round-trip through UTF-8 with errors="replace" so
+        every character in the result is writable.
+        """
+        try:
+            text = message.get_text(strict=False) or ""
+        except ValueError:
+            return ""
+        return text.encode("utf-8", errors="replace").decode("utf-8")
 
 
 def _guess_ct(path: Path) -> str:
