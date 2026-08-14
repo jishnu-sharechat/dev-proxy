@@ -249,7 +249,8 @@ function renderStats() {
 function renderRows() {
   const filtered = flows.filter(matchesFilters);
   const rows = $("#rows");
-  const wasAtSelectedScroll = rows.querySelector("tr.selected");
+  const container = rows.parentElement.parentElement;
+  const nearTop = container.scrollTop < 20;
   if (!filtered.length) {
     rows.innerHTML = `<tr><td colspan="5" class="empty">no flows match. Try clearing the filters,<br>or run \`proxyctl app restart\` to capture traffic.</td></tr>`;
     return;
@@ -268,7 +269,7 @@ function renderRows() {
       <td class="ms">${f.duration_ms ?? "–"}</td>
     </tr>`;
   }).join("");
-  if (!wasAtSelectedScroll && $("#fAutoscroll").checked) rows.parentElement.parentElement.scrollTop = 0;
+  if (nearTop && $("#fAutoscroll").checked) container.scrollTop = 0;
 }
 
 function renderHeaders(obj) {
