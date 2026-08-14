@@ -315,6 +315,10 @@ After that, this kind of thing works:
 It knows to filter before dumping, to open body files by path instead of pasting
 them, to verify a rule actually applied, and to clean up its rules afterward.
 
+This is real, not a promise. An agent ran the last two examples end to end on a
+real phone: it changed a live HTTPS response with `json_patch`, and it forced
+the same endpoint to `503`. See [REPORT.md](REPORT.md) for the full run.
+
 ---
 
 ## Contributing
