@@ -23,7 +23,7 @@ ok "mitmproxy: $(mitmdump --version 2>/dev/null | head -1)"
 
 command -v adb >/dev/null \
   && ok "adb: $(command -v adb)" \
-  || warn "adb not on PATH. Set \"adb\" in config.json, or add the Android SDK platform-tools."
+  || warn "adb not on PATH. Install it: brew install --cask android-platform-tools"
 
 # ------------------------------------------------------------------- proxyctl
 chmod +x "$ROOT/bin/proxyctl"
