@@ -49,6 +49,12 @@
   }
   header h1 { font-size: 14px; font-weight: 600; margin: 0; white-space: nowrap; }
   header h1 span { color: var(--text-muted); font-weight: 400; }
+  .ver { color: var(--text-dim); font-size: 11px; font-weight: 400; font-family: ui-monospace, monospace; }
+  .updatepill {
+    background: var(--mock-bg); color: var(--mock); border-radius: 8px;
+    padding: 1px 7px; font-size: 10px; font-weight: 600; margin-left: 4px;
+    font-family: -apple-system, sans-serif;
+  }
   .stats { display: flex; gap: 18px; flex: 1; }
   .stat { display: flex; flex-direction: column; min-width: 54px; }
   .stat .n { font-size: 17px; font-weight: 650; line-height: 1.1; }
@@ -198,7 +204,7 @@
 <body>
 
 <header>
-  <h1>dev-proxy <span>live view</span></h1>
+  <h1>dev-proxy <span>live view</span> <span class="ver" id="ver"></span></h1>
   <div class="stats" id="stats"></div>
   <div class="devices" id="devices"></div>
   <div><span class="live-dot" id="dot"></span><span class="stale-note" id="staleNote"></span></div>
@@ -678,10 +684,29 @@ async function tick() {
   }
 }
 
+// ------------------------------------------------------------------ version
+
+async function pollVersion() {
+  try {
+    const res = await fetch("/api/version?t=" + Date.now(), {cache: "no-store"});
+    if (!res.ok) throw new Error(res.status);
+    const v = await res.json();
+    $("#ver").innerHTML = esc(v.version || "")
+      + (v.behind > 0
+         ? ` <span class="updatepill" title="the clone is ${v.behind} commit(s) behind — run proxyctl update">update available</span>`
+         : "");
+  } catch (e) {
+    // An older server has no version route. Show nothing.
+    $("#ver").textContent = "";
+  }
+}
+
 tick();
 setInterval(tick, 1000);
 pollDevices();
 setInterval(pollDevices, 4000);
+pollVersion();
+setInterval(pollVersion, 300000);
 </script>
 </body>
 </html>
