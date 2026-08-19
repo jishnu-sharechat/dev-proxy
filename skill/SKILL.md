@@ -11,7 +11,7 @@ through one command and two files, so you never need a GUI.
 `proxyctl` is on the PATH after `install.sh`. The repo lives at
 `__DEVPROXY_HOME__`.
 
-Read `__DEVPROXY_HOME__/README.md` for the full rule reference.
+Read `__DEVPROXY_HOME__/docs/manual.md` for the full rule reference.
 
 ## Check the state first
 
