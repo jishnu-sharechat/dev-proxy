@@ -954,9 +954,24 @@ def _route_toggle_rule(body):
     return {"ok": True}
 
 
+def _route_app_restart(body):
+    """Restart the app under test, same as `proxyctl app restart`."""
+    cfg = load_config()
+    pkg = cfg.get("package")
+    if not pkg:
+        raise DashboardRouteError(400, 'no app package set. Fill "package" in config.json.')
+    if not devices(cfg):
+        raise DashboardRouteError(409, "no adb device connected")
+    ensure_reverse(cfg, quiet=True)
+    adb(cfg, "shell", "am", "force-stop", pkg)
+    time.sleep(0.8)
+    return {"ok": True, "started": start_app(cfg, pkg)}
+
+
 DASHBOARD_ROUTES = {
     "/api/clear": lambda body: (_clear_flows(), {"ok": True})[1],
     "/api/rules/toggle": _route_toggle_rule,
+    "/api/app/restart": _route_app_restart,
 }
 
 
@@ -993,6 +1008,11 @@ def _make_dashboard_handler():
             except DashboardRouteError as exc:
                 result = {"ok": False, "error": str(exc)}
                 status = exc.status
+            except SystemExit:
+                # A route reached die(). Keep the server thread alive and
+                # report the failure instead. Details are in the web log.
+                result = {"ok": False, "error": "the command failed. See var/webui.log."}
+                status = 500
             except Exception as exc:
                 result = {"ok": False, "error": str(exc)}
                 status = 500
