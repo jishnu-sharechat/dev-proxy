@@ -129,6 +129,21 @@
     display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 8px;
     background: var(--mock-bg); color: var(--mock); margin-left: 6px; font-weight: 600;
   }
+  td.act { text-align: right; padding-right: 8px; }
+  .rowbtn {
+    background: var(--code-bg); border: 1px solid var(--border); color: var(--text-muted);
+    border-radius: 4px; padding: 1px 5px; font-size: 10px; font-family: ui-monospace, monospace;
+    cursor: pointer; visibility: hidden;
+  }
+  tbody tr:hover .rowbtn, tbody tr.selected .rowbtn { visibility: visible; }
+  .rowbtn:hover { color: var(--text); border-color: var(--accent); }
+  .rowbtn.copied, .copybtn.copied { color: var(--good); border-color: var(--good); visibility: visible; }
+  .copybtn {
+    background: var(--code-bg); border: 1px solid var(--border); color: var(--text-muted);
+    border-radius: 5px; padding: 2px 8px; font-size: 11px; font-family: inherit; cursor: pointer;
+  }
+  .copybtn:hover { color: var(--text); border-color: var(--accent); }
+  .section h3 .copybtn { float: right; margin-top: -3px; }
   .empty { padding: 40px 20px; text-align: center; color: var(--text-dim); }
 
   .detail-inner { padding: 16px 18px; }
@@ -192,6 +207,7 @@
     <thead><tr>
       <th style="width:82px">time</th><th style="width:46px">st</th>
       <th style="width:56px">meth</th><th>url</th><th style="width:56px">ms</th>
+      <th style="width:96px"></th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table></div>
@@ -301,7 +317,7 @@ function renderRows() {
   const container = rows.parentElement.parentElement;
   const nearTop = container.scrollTop < 20;
   if (!filtered.length) {
-    rows.innerHTML = `<tr><td colspan="5" class="empty">no flows match. Try clearing the filters,<br>or run \`proxyctl app restart\` to capture traffic.</td></tr>`;
+    rows.innerHTML = `<tr><td colspan="6" class="empty">no flows match. Try clearing the filters,<br>or run \`proxyctl app restart\` to capture traffic.</td></tr>`;
     return;
   }
   rows.innerHTML = filtered.slice().reverse().map(f => {
@@ -316,9 +332,85 @@ function renderRows() {
       <td class="method">${esc(f.method || "")}</td>
       <td class="url"><span class="host">${esc(host)}</span>${esc(path)}${tag ? `<span class="tag">${tag}</span>` : ""}</td>
       <td class="ms">${f.duration_ms ?? "–"}</td>
+      <td class="act">
+        <button class="rowbtn" data-act="curl" title="copy the request as a cURL command">curl</button>
+        <button class="rowbtn" data-act="resp" title="copy the response body">resp</button>
+      </td>
     </tr>`;
   }).join("");
   if (nearTop && $("#fAutoscroll").checked) container.scrollTop = 0;
+}
+
+// ------------------------------------------------------------- copy actions
+
+function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+// Build the cURL command from the flow record plus the request body text.
+// Pure on purpose, so it is testable without a DOM or a fetch.
+function curlCommand(f, reqBody) {
+  const parts = ["curl"];
+  const method = (f.method || "GET").toUpperCase();
+  if (method !== "GET") parts.push("-X", method);
+  parts.push(shellQuote(f.url || ""));
+  // These headers describe the original transport, not the request itself.
+  // curl computes its own; sending the captured ones breaks the replay.
+  const skip = new Set(["content-length", "accept-encoding", "connection", "host"]);
+  for (const [k, v] of Object.entries(f.req_headers || {})) {
+    if (skip.has(k.toLowerCase())) continue;
+    parts.push("-H", shellQuote(k + ": " + v));
+  }
+  if (reqBody) parts.push("--data-raw", shellQuote(reqBody));
+  return parts.join(" ");
+}
+
+// The flow record carries a short preview; the full body sits in a file.
+// Prefer the file, fall back to the preview.
+async function fullBodyText(f, side) {
+  const file = f[side + "_body_file"];
+  if (file) {
+    try { return await fetchText("../" + file); } catch (e) {}
+  }
+  return f[side + "_preview"] || "";
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    // http://127.0.0.1 counts as a secure context, but keep a fallback for
+    // browsers that still gate the async clipboard behind a permission.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e2) {}
+    ta.remove();
+    return ok;
+  }
+}
+
+async function copyToButton(btn, text) {
+  const ok = await copyText(text);
+  const old = btn.textContent;
+  btn.textContent = ok ? "copied" : "failed";
+  btn.classList.add("copied");
+  setTimeout(() => { btn.textContent = old; btn.classList.remove("copied"); }, 1200);
+}
+
+async function copyFlowAction(btn, f, act) {
+  if (act === "curl") {
+    copyToButton(btn, curlCommand(f, await fullBodyText(f, "req")));
+  } else if (act === "resp") {
+    copyToButton(btn, await fullBodyText(f, "resp"));
+  } else if (act === "req") {
+    copyToButton(btn, await fullBodyText(f, "req"));
+  }
 }
 
 function renderHeaders(obj) {
@@ -327,15 +419,12 @@ function renderHeaders(obj) {
     `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`).join("") + `</div>`;
 }
 
-async function renderBody(label, previewKey, fileKey, f) {
-  const preview = f[previewKey];
-  const file = f[fileKey];
+async function renderBody(label, side, f) {
+  const preview = f[side + "_preview"];
+  const file = f[side + "_body_file"];
   if (!preview && !file) return "";
-  let full = preview || "";
-  if (file) {
-    try { full = await fetchText("../" + file); } catch (e) {}
-  }
-  return `<div class="section"><h3>${label}</h3><pre class="body">${esc(full)}</pre>${file ? `<div class="filepath">${esc(file)}</div>` : ""}</div>`;
+  const full = await fullBodyText(f, side);
+  return `<div class="section"><h3>${label}<button class="copybtn" data-copy="${side}" title="copy the full ${label}">copy</button></h3><pre class="body">${esc(full)}</pre>${file ? `<div class="filepath">${esc(file)}</div>` : ""}</div>`;
 }
 
 async function renderDetail(f) {
@@ -360,15 +449,16 @@ async function renderDetail(f) {
 
   det.innerHTML = `<div class="detail-inner">
     <div class="d-title">${esc(f.method || "")} ${esc(path)}</div>
-    <div class="d-sub"><span>${esc(host)}</span><span>${f.duration_ms ? f.duration_ms + " ms" : ""}</span>${badges}</div>
+    <div class="d-sub"><span>${esc(host)}</span><span>${f.duration_ms ? f.duration_ms + " ms" : ""}</span>${badges}
+      <button class="copybtn" data-copy="curl" title="copy the request as a cURL command">copy cURL</button></div>
     ${why}
     <div class="section"><h3>request headers</h3>${renderHeaders(f.req_headers)}</div>
     <div class="section"><h3>response headers</h3>${renderHeaders(f.resp_headers)}</div>
     <div id="bodies"></div>
   </div>`;
 
-  const reqBody = await renderBody("request body", "req_preview", "req_body_file", f);
-  const respBody = await renderBody("response body", "resp_preview", "resp_body_file", f);
+  const reqBody = await renderBody("request body", "req", f);
+  const respBody = await renderBody("response body", "resp", f);
   det.querySelector("#bodies").innerHTML = reqBody + respBody;
 }
 
@@ -383,7 +473,20 @@ function selectFlow(id) {
 $("#rows").addEventListener("click", (e) => {
   const tr = e.target.closest("tr[data-id]");
   if (!tr) return;
+  const btn = e.target.closest(".rowbtn[data-act]");
+  if (btn) {
+    const f = flows.find(x => x.id === Number(tr.dataset.id));
+    if (f) copyFlowAction(btn, f, btn.dataset.act);
+    return;
+  }
   selectFlow(Number(tr.dataset.id));
+});
+
+$("#detail").addEventListener("click", (e) => {
+  const btn = e.target.closest(".copybtn[data-copy]");
+  if (!btn) return;
+  const f = flows.find(x => x.id === selectedId);
+  if (f) copyFlowAction(btn, f, btn.dataset.copy);
 });
 
 // A URL like #42 opens straight to that flow — handy for sharing a link to one call.
