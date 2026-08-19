@@ -1165,6 +1165,63 @@ def cmd_setup(cfg, args):
     info("step 4/4 after the taps above, run `proxyctl cert verify`")
 
 
+def cmd_map(cfg, args):
+    """Map a URL to a local file. The user edits the file; the proxy serves it.
+
+    Different from `mock`: it needs no captured flow. It creates the file when
+    the file is missing, and seeds it from the newest matching captured
+    response when one exists.
+    """
+    host_re = args.host if args.regex else re.escape(args.host)
+    path_re = args.path if args.regex else "^" + re.escape(args.path)
+    name = args.name or (re.sub(r"[^a-zA-Z0-9]+", "_", args.path).strip("_") or "map")
+    target = Path(args.file).expanduser() if args.file else MAPS / f"{name}.json"
+    if not target.is_absolute():
+        target = ROOT / target
+    created = False
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_seed_body(args.host, args.path))
+        created = True
+    try:
+        file_ref = str(target.relative_to(ROOT))
+    except ValueError:
+        file_ref = str(target)
+    rule_id = args.rule_id or f"map_{name}"[:40]
+    rule = {
+        "id": rule_id,
+        "name": f"map local for {args.path}",
+        "enabled": True,
+        "match": {"host": host_re, "path": path_re},
+        "action": {
+            "type": "map_local",
+            "file": file_ref,
+            "status": args.status,
+            "content_type": args.content_type,
+        },
+    }
+    data = read_rules()
+    data.setdefault("rules", [])
+    data["rules"] = [r for r in data["rules"] if r.get("id") != rule_id]
+    data["rules"].append(rule)
+    write_rules(data)
+    ok(("created " if created else "using existing ") + str(target))
+    ok(f"rule {rule_id} added")
+    print("  Edit the file. The next matching request serves the new content.")
+    print("  No restart is needed. The proxy reads the file on every request.")
+
+
+def _seed_body(host, path):
+    """Newest captured response body for host+path, or an empty JSON object."""
+    for f in reversed(_read_flows()):
+        if f.get("host") == host and f.get("path") == path and f.get("resp_body_file"):
+            p = ROOT / f["resp_body_file"]
+            if p.exists():
+                info(f"seeded the file from captured flow #{f.get('id')}")
+                return p.read_text(errors="replace")
+    return "{\n}\n"
+
+
 def cmd_mock(cfg, args):
     """Shortcut: capture a real response, save it, and serve it locally."""
     flows = {str(f.get("id")): f for f in _read_flows()}
@@ -1287,6 +1344,17 @@ def main():
     sp.add_argument("id")
     sp.add_argument("--name"); sp.add_argument("--rule-id")
     sp.set_defaults(fn=cmd_mock)
+
+    sp = sub.add_parser("map", help="serve a URL from a local file you edit live")
+    sp.add_argument("host", help="host to match, e.g. api.example.com")
+    sp.add_argument("path", help="path to match, e.g. /v1/feed")
+    sp.add_argument("--file", help="the mapping file (default: maps/<derived>.json)")
+    sp.add_argument("--status", type=int, default=200)
+    sp.add_argument("--content-type", dest="content_type", default="application/json")
+    sp.add_argument("--name"); sp.add_argument("--rule-id")
+    sp.add_argument("--regex", action="store_true",
+                    help="treat host and path as regexes instead of literals")
+    sp.set_defaults(fn=cmd_map)
 
     sp = sub.add_parser("replay", help="send a captured request again")
     sp.add_argument("id"); sp.add_argument("--timeout", type=int, default=30)
