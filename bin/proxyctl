@@ -41,6 +41,9 @@ CA_PEM = CA_DIR / "mitmproxy-ca-cert.pem"
 WEBUI_DIR = ROOT / "webui"
 WEB_PID_FILE = VAR / "webui.pid"
 WEB_LOG_FILE = VAR / "webui.log"
+UPDATE_STAMP = VAR / "update_check.json"
+SKILL_SRC = ROOT / "skill" / "SKILL.md"
+SKILL_DST = Path.home() / ".claude" / "skills" / "dev-proxy" / "SKILL.md"
 
 DEFAULT_BYPASS = ["localhost", "127.0.0.1", "10.0.2.2", "*.local"]
 
@@ -298,6 +301,10 @@ def cmd_status(cfg, args):
         print(f"  {mark} {r.get('id','?'):<12} {kinds:<14} {r.get('name','')}")
     n = sum(1 for _ in FLOWS_FILE.open()) if FLOWS_FILE.exists() else 0
     print(f"{C['bold']}flows{C['off']}    {n} captured")
+    upd = update_check()
+    if upd and upd.get("behind"):
+        warn(f"update available: {upd['behind']} commit(s) behind origin/main. "
+             "Run `proxyctl update`.")
 
 
 # ------------------------------------------------------------------ device
@@ -1029,8 +1036,19 @@ DASHBOARD_ROUTES = {
     "/api/device/disconnect": _route_device_disconnect,
 }
 
+def _route_version(body=None):
+    """Local version plus the cached behind-origin count for the header."""
+    stamp = update_check() or {}
+    return {
+        "ok": True,
+        "version": local_version(),
+        "behind": int(stamp.get("behind") or 0),
+    }
+
+
 DASHBOARD_GET_ROUTES = {
     "/api/devices": _route_devices,
+    "/api/version": _route_version,
 }
 
 
@@ -1050,6 +1068,12 @@ def _make_dashboard_handler():
     class Handler(http.server.SimpleHTTPRequestHandler):
         def log_message(self, fmt, *a):
             pass  # proxyctl web redirects this process's stdout/stderr to WEB_LOG_FILE already
+
+        def end_headers(self):
+            # A cached page hides UI updates behind a hard refresh nobody
+            # does. Everything here is local and cheap; never cache it.
+            self.send_header("Cache-Control", "no-store")
+            super().end_headers()
 
         def _run_route(self, route, body):
             try:
@@ -1152,6 +1176,88 @@ def cmd_web(cfg, args):
     print(f"  It polls var/flows.jsonl once a second. No refresh needed.")
     if args.open:
         subprocess.run(["open", url])
+
+
+def _git(*a, timeout=None):
+    return subprocess.run(["git", "-C", str(ROOT), *a],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def local_version():
+    if not (ROOT / ".git").exists():
+        return None
+    return _git("rev-parse", "--short", "HEAD").stdout.strip() or None
+
+
+def update_check(force=False):
+    """Compare local HEAD with origin/main, at most once a day.
+
+    Returns {checked_at, behind, local} or None when unknown. Never blocks
+    long and never fails loudly. Offline is a normal state: the fetch is
+    skipped and the count runs against the last-known origin/main.
+    """
+    if not (ROOT / ".git").exists():
+        return None
+    stamp = {}
+    if UPDATE_STAMP.exists():
+        try:
+            stamp = json.loads(UPDATE_STAMP.read_text())
+        except (json.JSONDecodeError, OSError):
+            stamp = {}
+    now = time.time()
+    if not force and now - stamp.get("checked_at", 0) < 86400:
+        return stamp or None
+    try:
+        _git("fetch", "--quiet", "origin", "main", timeout=6)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    try:
+        behind = int(_git("rev-list", "--count", "HEAD..origin/main").stdout.strip())
+    except ValueError:
+        behind = 0
+    stamp = {"checked_at": now, "behind": behind, "local": local_version()}
+    try:
+        VAR.mkdir(parents=True, exist_ok=True)
+        UPDATE_STAMP.write_text(json.dumps(stamp))
+    except OSError:
+        pass
+    return stamp
+
+
+def regenerate_skill():
+    """Write the installed skill from skill/SKILL.md, same as install.sh."""
+    if not SKILL_SRC.exists():
+        return False
+    SKILL_DST.parent.mkdir(parents=True, exist_ok=True)
+    SKILL_DST.write_text(SKILL_SRC.read_text().replace("__DEVPROXY_HOME__", str(ROOT)))
+    return True
+
+
+def cmd_update(cfg, args):
+    """Pull the latest dev-proxy and refresh everything that consumes it."""
+    if not (ROOT / ".git").exists():
+        die("this dev-proxy is not a git clone, so it cannot self-update")
+    info("pulling the latest dev-proxy")
+    res = _git("pull", "--ff-only")
+    if res.returncode != 0:
+        die(f"git pull failed: {(res.stderr or res.stdout).strip()}")
+    summary = (res.stdout or "").strip().splitlines()
+    if summary:
+        print("  " + summary[-1])
+    if regenerate_skill():
+        ok(f"skill regenerated at {SKILL_DST}")
+    # The dashboard process holds the old server code. Pure HTML changes only
+    # need a browser refresh, but new routes need a new process.
+    if read_web_pid():
+        info("restarting the dashboard server")
+        cmd_web(cfg, argparse.Namespace(action="off", open=False))
+        cmd_web(cfg, argparse.Namespace(action="on", open=False))
+        print("  refresh the dashboard tab in the browser")
+    if read_pid():
+        warn("the running proxy still uses the old addon code. "
+             "Run `proxyctl restart` when the current capture can stop.")
+    update_check(force=True)
+    ok(f"dev-proxy is at {local_version() or 'unknown'}")
 
 
 def cmd_setup(cfg, args):
@@ -1338,6 +1444,9 @@ def main():
 
     sp = sub.add_parser("setup", help="start, wire the device, install the certificate")
     sp.set_defaults(fn=cmd_setup)
+
+    sp = sub.add_parser("update", help="pull the latest dev-proxy, refresh the skill and dashboard")
+    sp.set_defaults(fn=cmd_update)
 
     sp = sub.add_parser("web", help="serve the live dashboard (flow list + inspector)")
     sp.add_argument("action", nargs="?", default="on", choices=["on", "off", "status"])
