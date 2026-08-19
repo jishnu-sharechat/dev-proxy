@@ -98,6 +98,17 @@ proxyctl mock 57 --name feed    # writes maps/feed.json plus a map_local rule
 
 Then edit `maps/feed.json` with the Edit tool. The next request serves it.
 
+Map a URL to a file without a captured flow:
+
+```bash
+proxyctl map api.example.com /v1/feed --file maps/feed.json
+```
+
+It creates the file when the file is missing. It seeds the file from the
+newest captured response for that URL when one exists. Host and path are
+literals here, not regexes. Pass `--regex` for patterns. Edits to the file
+apply on the next request. Never restart the proxy for a file edit.
+
 ## Clean up
 
 Always remove the rules you added once the user confirms the test is done. A
