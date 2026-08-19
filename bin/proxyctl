@@ -326,21 +326,31 @@ def cmd_device(cfg, args):
         print(f"  bypass: {bypass}")
         warn("restart the app so it picks up the new proxy")
     else:
-        adb(cfg, "shell", "settings", "put", "global", "http_proxy", ":0")
-        for key in ("http_proxy", "global_http_proxy_host", "global_http_proxy_port",
-                    "global_http_proxy_exclusion_list"):
-            adb(cfg, "shell", "settings", "delete", "global", key)
-        adb(cfg, "reverse", "--remove", f"tcp:{port}")
-        proxy = (adb(cfg, "shell", "settings", "get", "global",
-                     "http_proxy").stdout or "").strip()
-        rev = adb(cfg, "reverse", "--list").stdout or ""
-        left = f"tcp:{port}" in rev
+        proxy, left = device_off(cfg)
         if proxy not in ("null", "") or left:
             warn(f"device still shows http_proxy={proxy or 'unset'}"
                  + (f", reverse tunnel tcp:{port} still active" if left else "")
                  + ". Clear by hand: adb shell settings delete global http_proxy")
         else:
             ok("device proxy removed and verified clear")
+
+
+def device_off(cfg, serial=None):
+    """Remove the proxy wiring from one device.
+
+    Returns (remaining_proxy_setting, reverse_tunnel_still_present) so the
+    caller can verify the device really is clear.
+    """
+    port = cfg["port"]
+    adb(cfg, "shell", "settings", "put", "global", "http_proxy", ":0", serial=serial)
+    for key in ("http_proxy", "global_http_proxy_host", "global_http_proxy_port",
+                "global_http_proxy_exclusion_list"):
+        adb(cfg, "shell", "settings", "delete", "global", key, serial=serial)
+    adb(cfg, "reverse", "--remove", f"tcp:{port}", serial=serial)
+    proxy = (adb(cfg, "shell", "settings", "get", "global",
+                 "http_proxy", serial=serial).stdout or "").strip()
+    rev = adb(cfg, "reverse", "--list", serial=serial).stdout or ""
+    return proxy, f"tcp:{port}" in rev
 
 
 def ensure_reverse(cfg, quiet=False):
@@ -968,10 +978,59 @@ def _route_app_restart(body):
     return {"ok": True, "started": start_app(cfg, pkg)}
 
 
+def _route_devices(body=None):
+    """List adb devices and whether each one routes through this proxy."""
+    cfg = load_config()
+    port = cfg["port"]
+    out = []
+    for serial in devices(cfg):
+        model = (adb(cfg, "shell", "getprop", "ro.product.model",
+                     serial=serial).stdout or "").strip()
+        proxy = (adb(cfg, "shell", "settings", "get", "global",
+                     "http_proxy", serial=serial).stdout or "").strip()
+        if proxy in ("null", ":0"):
+            proxy = ""
+        rev = adb(cfg, "reverse", "--list", serial=serial).stdout or ""
+        has_reverse = f"tcp:{port}" in rev
+        # A loopback proxy needs the reverse tunnel to carry traffic. A LAN
+        # proxy reaches this machine over the network on its own.
+        active = bool(proxy) and (has_reverse if proxy.startswith("127.0.0.1") else True)
+        out.append({
+            "serial": serial,
+            "model": model,
+            "proxy": proxy or None,
+            "reverse": has_reverse,
+            "active": active,
+        })
+    return {"ok": True, "port": port, "devices": out}
+
+
+def _route_device_disconnect(body):
+    try:
+        payload = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        raise DashboardRouteError(400, "malformed JSON body")
+    serial = payload.get("serial")
+    cfg = load_config()
+    devs = devices(cfg)
+    if not devs:
+        raise DashboardRouteError(409, "no adb device connected")
+    if serial and serial not in devs:
+        raise DashboardRouteError(404, f"unknown device {serial!r}")
+    proxy, rev_left = device_off(cfg, serial=serial)
+    clear = proxy in ("null", "") and not rev_left
+    return {"ok": True, "clear": clear, "proxy": proxy or None}
+
+
 DASHBOARD_ROUTES = {
     "/api/clear": lambda body: (_clear_flows(), {"ok": True})[1],
     "/api/rules/toggle": _route_toggle_rule,
     "/api/app/restart": _route_app_restart,
+    "/api/device/disconnect": _route_device_disconnect,
+}
+
+DASHBOARD_GET_ROUTES = {
+    "/api/devices": _route_devices,
 }
 
 
@@ -992,16 +1051,7 @@ def _make_dashboard_handler():
         def log_message(self, fmt, *a):
             pass  # proxyctl web redirects this process's stdout/stderr to WEB_LOG_FILE already
 
-        def do_POST(self):
-            route = DASHBOARD_ROUTES.get(self.path)
-            if route is None:
-                self.send_error(404)
-                return
-            if not _dashboard_same_origin(self):
-                self.send_error(403, "cross-origin request rejected")
-                return
-            length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(length) if length else b""
+        def _run_route(self, route, body):
             try:
                 result = route(body)
                 status = 200
@@ -1022,6 +1072,25 @@ def _make_dashboard_handler():
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
+
+        def do_GET(self):
+            route = DASHBOARD_GET_ROUTES.get(self.path.split("?")[0])
+            if route is None:
+                super().do_GET()
+                return
+            self._run_route(route, b"")
+
+        def do_POST(self):
+            route = DASHBOARD_ROUTES.get(self.path)
+            if route is None:
+                self.send_error(404)
+                return
+            if not _dashboard_same_origin(self):
+                self.send_error(403, "cross-origin request rejected")
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b""
+            self._run_route(route, body)
 
     return functools.partial(Handler, directory=str(ROOT))
 

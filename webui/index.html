@@ -56,6 +56,21 @@
   .stat.good .n { color: var(--good); }
   .stat.bad .n { color: var(--bad); }
   .stat.warn .n { color: var(--warn); }
+  .devices { display: flex; gap: 8px; align-items: center; }
+  .dev {
+    display: flex; align-items: center; gap: 6px; font-size: 11px;
+    border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px;
+    color: var(--text-muted); white-space: nowrap;
+  }
+  .dev b { color: var(--text); font-weight: 600; }
+  .devdot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); flex-shrink: 0; }
+  .devdot.active { background: var(--good); }
+  .devdisc {
+    background: var(--code-bg); border: 1px solid var(--border); color: var(--text-muted);
+    border-radius: 4px; padding: 1px 6px; font-size: 10px; font-family: inherit; cursor: pointer;
+  }
+  .devdisc:hover { color: var(--bad); border-color: var(--bad); }
+  .devdisc:disabled { opacity: .55; cursor: default; }
   .live-dot {
     width: 7px; height: 7px; border-radius: 50%; background: var(--good);
     display: inline-block; margin-right: 6px; flex-shrink: 0;
@@ -185,6 +200,7 @@
 <header>
   <h1>dev-proxy <span>live view</span></h1>
   <div class="stats" id="stats"></div>
+  <div class="devices" id="devices"></div>
   <div><span class="live-dot" id="dot"></span><span class="stale-note" id="staleNote"></span></div>
 </header>
 
@@ -586,6 +602,55 @@ $("#rulesPanel").addEventListener("change", async (e) => {
   }
 });
 
+// ------------------------------------------------------------------ devices
+
+// Polled on its own, slower timer: each device costs a few adb round trips
+// on the server, so once a second would be wasteful.
+async function pollDevices() {
+  const box = $("#devices");
+  try {
+    const res = await fetch("/api/devices?t=" + Date.now(), {cache: "no-store"});
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    const devs = data.devices || [];
+    if (!devs.length) {
+      box.innerHTML = `<span class="dev"><span class="devdot"></span>no device</span>`;
+      return;
+    }
+    box.innerHTML = devs.map(d => {
+      const state = d.active ? "proxied" : (d.proxy ? "proxy set, tunnel down" : "not proxied");
+      const wired = d.proxy || d.reverse;
+      return `<span class="dev" title="serial ${esc(d.serial)}${d.proxy ? " — proxy " + esc(d.proxy) : ""}">
+        <span class="devdot${d.active ? " active" : ""}"></span>
+        <b>${esc(d.model || d.serial)}</b> ${esc(state)}
+        ${wired ? `<button class="devdisc" data-serial="${esc(d.serial)}" title="remove the proxy settings from this device">disconnect</button>` : ""}
+      </span>`;
+    }).join("");
+  } catch (e) {
+    box.innerHTML = "";
+  }
+}
+
+$("#devices").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".devdisc");
+  if (!btn) return;
+  if (!confirm("Remove the proxy settings from this device? The device then talks to the network directly.")) return;
+  btn.disabled = true;
+  btn.textContent = "…";
+  try {
+    const res = await fetch("/api/device/disconnect", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({serial: btn.dataset.serial}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
+  } catch (err) {
+    alert("Could not disconnect the device: " + err.message);
+  }
+  pollDevices();
+});
+
 async function tick() {
   try {
     const [flowText, rulesText] = await Promise.all([
@@ -615,6 +680,8 @@ async function tick() {
 
 tick();
 setInterval(tick, 1000);
+pollDevices();
+setInterval(pollDevices, 4000);
 </script>
 </body>
 </html>
