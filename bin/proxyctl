@@ -1165,6 +1165,60 @@ def cmd_setup(cfg, args):
     info("step 4/4 after the taps above, run `proxyctl cert verify`")
 
 
+def cmd_paths(cfg, args):
+    """List dotted JSON paths in a captured response body.
+
+    This exists so a json_patch path can be verified against the real
+    response before a rule is written. A user-typed field name often has a
+    typo or the wrong capitalization; a rule made from it silently never
+    applies.
+    """
+    flows = {str(f.get("id")): f for f in _read_flows()}
+    f = flows.get(str(args.id))
+    if not f:
+        die(f"no flow with id {args.id}")
+    src = f.get("resp_body_file")
+    if not src or not (ROOT / src).exists():
+        die(f"flow {args.id} has no saved response body")
+    try:
+        data = json.loads((ROOT / src).read_text(errors="replace"))
+    except json.JSONDecodeError as exc:
+        die(f"the response body is not JSON: {exc}")
+
+    rows = []
+
+    def walk(node, prefix):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, f"{prefix}.{k}" if prefix else str(k))
+        elif isinstance(node, list):
+            if not node:
+                rows.append((prefix, "[]"))
+            else:
+                # One element is enough to learn the shape. Every index of a
+                # 500-item feed would bury the useful paths.
+                walk(node[0], f"{prefix}.0")
+                if len(node) > 1:
+                    rows.append((f"{prefix}.1..{len(node) - 1}", f"[{len(node)} items total]"))
+        else:
+            rows.append((prefix, json.dumps(node)))
+
+    walk(data, "")
+    query = (args.query or "").lower()
+    hits = [(p, v) for p, v in rows if query in p.lower()] if query else rows
+    if not hits:
+        print(f"no path contains {args.query!r}. "
+              f"Rerun without a query to list all {len(rows)} paths.")
+        return
+    shown = hits[: args.limit]
+    for p, v in shown:
+        val = v if len(v) <= 80 else v[:77] + "..."
+        print(f"  {p} = {val}")
+    if len(hits) > len(shown):
+        print(f"  ... {len(hits) - len(shown)} more. Narrow with a query, "
+              f"or raise --limit.")
+
+
 def cmd_map(cfg, args):
     """Map a URL to a local file. The user edits the file; the proxy serves it.
 
@@ -1326,6 +1380,12 @@ def main():
     sp = sub.add_parser("body", help="print the path of a saved body file")
     sp.add_argument("id"); sp.add_argument("side", choices=["req", "resp"])
     sp.set_defaults(fn=cmd_body)
+
+    sp = sub.add_parser("paths", help="list dotted JSON paths in a response body")
+    sp.add_argument("id")
+    sp.add_argument("query", nargs="?", help="case-insensitive filter on the path")
+    sp.add_argument("--limit", type=int, default=200)
+    sp.set_defaults(fn=cmd_paths)
 
     sp = sub.add_parser("clear", help="delete the flow log and saved bodies")
     sp.set_defaults(fn=cmd_clear)

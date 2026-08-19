@@ -87,6 +87,28 @@ cat __DEVPROXY_HOME__/var/addon.log
 Add `"create": true` when you mean to add a new field. Use `merge` for a new
 top level key. Never assume a patch applied. Confirm it in the flow log.
 
+## Verify a field name before you patch it
+
+A user-typed field name often has a typo or the wrong capitalization. A rule
+made from a wrong name never applies, and the failure is silent. Never put a
+user-typed name straight into a `json_patch` rule. Verify it first:
+
+1. Find the newest captured flow for the endpoint: `proxyctl flows --url <endpoint>`.
+2. List the real paths for that name: `proxyctl paths <id> <fieldname>`.
+3. The command prints the exact dotted path and the current value. Use that
+   path in the rule, not the user's spelling.
+4. The name differs from what the user typed (case or spelling): ask the user
+   one short question first, for example "the response has
+   `payload.config.gamesEnabled`, not `gamesenabled` — patch that?".
+5. No match at all: tell the user the field is not in the captured response,
+   and show the closest paths. Do not add the rule. Do not use
+   `"create": true` unless the user confirms they want a brand-new field.
+6. No captured flow for the endpoint yet: capture one first
+   (`proxyctl app restart`, or ask the user to open the screen), then verify.
+
+After you add the rule, confirm it fired with `proxyctl flows --mocked`. A
+`!NOT_APPLIED` tag means the path was still wrong.
+
 Some endpoints may return `application/x-protobuf`. `json_patch` cannot edit
 those. Use `map_local` or `status` instead.
 
