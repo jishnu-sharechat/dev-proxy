@@ -249,6 +249,41 @@ The `capture` block in `rules/rules.json` filters the log, not the traffic:
 Set `include_hosts` to watch one backend and ignore everything else. Image
 and video CDNs otherwise bury your API calls.
 
+## Send raw MQTT
+
+The proxy is HTTP only. Raw MQTT rides its own TCP socket and never passes
+through it. So `proxyctl mqtt` does not intercept the real broker. It runs a
+local broker you own, then publishes into it.
+
+```bash
+proxyctl mqtt broker                       # start a local TLS broker + adb reverse
+proxyctl mqtt pub live/room/42 '{"x":1}'   # publish one message
+proxyctl mqtt sub live/room/42             # watch a topic
+proxyctl mqtt status                       # broker + reverse state
+proxyctl mqtt broker --stop                # stop, remove the reverse
+```
+
+The app connects over TLS, so the broker serves a leaf certificate signed by
+the mitmproxy CA. A debug build already trusts that CA, so no extra taps are
+needed. `mosquitto` must be present (`brew install mosquitto`). The generated
+key and certificate live under `var/mqtt/` and are never committed.
+
+`broker` also runs `adb reverse tcp:8883 tcp:8883`, so the device reaches the
+Mac broker on its own localhost. Point the app's broker override at the printed
+URL (`ssl://127.0.0.1:8883`) and restart the app.
+
+| Flag | Applies to | Meaning |
+|---|---|---|
+| `--host`, `--port` | pub, sub | Target a different broker (default `127.0.0.1:8883`) |
+| `--no-tls` | pub, sub | Plain TCP instead of TLS |
+| `--insecure` | pub, sub | TLS without verifying the broker certificate |
+| `--qos` | pub, sub | QoS level 0, 1, or 2 (default 1) |
+| `--retain` | pub | Set the retain flag |
+| `--count`, `--timeout` | sub | Stop after N messages or N seconds |
+
+The topic the app listens on comes from an HTTP response, so `proxyctl flows`
+can read it. Publish to that exact topic for the app to process the message.
+
 ## config.json reference
 
 | Key | Meaning |
