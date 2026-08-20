@@ -164,6 +164,11 @@ Steps to make the app receive a message:
 at another broker with `--host`, `--port`, and `--no-tls`. Useful flags:
 `--qos`, `--retain`, and for `sub` the `--count` and `--timeout` limits.
 
+The web dashboard (`proxyctl web`) has the same as a form. Click **send MQTT**
+in the toolbar to open a panel: start or stop the broker, paste a topic and a
+message, and hit **send**. This is the paste-and-send path when you do not want
+the terminal.
+
 Clear the broker override in the app to return to the real broker.
 
 ## Clean up

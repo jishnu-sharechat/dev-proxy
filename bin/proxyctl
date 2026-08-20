@@ -1038,11 +1038,73 @@ def _route_device_disconnect(body):
     return {"ok": True, "clear": clear, "proxy": proxy or None}
 
 
+def _route_mqtt_status(body=None):
+    """Local MQTT broker state for the dashboard panel."""
+    cfg = load_config()
+    port = MQTT_DEFAULT_PORT
+    reverse = False
+    if devices(cfg):
+        rev = adb(cfg, "reverse", "--list").stdout or ""
+        reverse = f"tcp:{port}" in rev
+    return {
+        "ok": True,
+        "running": bool(_mqtt_broker_pid()),
+        "port": port,
+        "reverse": reverse,
+        "mosquitto": _mosquitto_bin("mosquitto") is not None,
+        "override": f"ssl://127.0.0.1:{port}",
+    }
+
+
+def _route_mqtt_broker(body):
+    """Start or stop the local broker from the dashboard."""
+    try:
+        payload = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        raise DashboardRouteError(400, "malformed JSON body")
+    action = payload.get("action")
+    cfg = load_config()
+    if action == "start":
+        if not _mosquitto_bin("mosquitto"):
+            raise DashboardRouteError(400, "mosquitto is not installed. Run: brew install mosquitto")
+        if not CA_KEY_PEM.exists():
+            raise DashboardRouteError(400, "mitmproxy CA not found. Run `proxyctl start` once.")
+        _mqtt_broker_start(cfg, MQTT_DEFAULT_PORT)
+    elif action == "stop":
+        _mqtt_broker_stop(cfg, MQTT_DEFAULT_PORT)
+    else:
+        raise DashboardRouteError(400, 'expected {"action": "start"|"stop"}')
+    return _route_mqtt_status()
+
+
+def _route_mqtt_pub(body):
+    """Publish one message to the local broker, the paste-and-send path."""
+    try:
+        payload = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        raise DashboardRouteError(400, "malformed JSON body")
+    topic = (payload.get("topic") or "").strip()
+    message = payload.get("payload")
+    if not topic or message is None:
+        raise DashboardRouteError(400, 'expected {"topic": str, "payload": str}')
+    if not _mqtt_broker_pid():
+        raise DashboardRouteError(409, "the local broker is not running. Start it first.")
+    qos = payload.get("qos")
+    qos = int(qos) if qos in (0, 1, 2, "0", "1", "2") else 1
+    ok_pub, msg = _mqtt_publish(topic, str(message), "127.0.0.1",
+                                MQTT_DEFAULT_PORT, qos, bool(payload.get("retain")))
+    if not ok_pub:
+        raise DashboardRouteError(502, msg)
+    return {"ok": True, "topic": topic, "message": msg}
+
+
 DASHBOARD_ROUTES = {
     "/api/clear": lambda body: (_clear_flows(), {"ok": True})[1],
     "/api/rules/toggle": _route_toggle_rule,
     "/api/app/restart": _route_app_restart,
     "/api/device/disconnect": _route_device_disconnect,
+    "/api/mqtt/broker": _route_mqtt_broker,
+    "/api/mqtt/pub": _route_mqtt_pub,
 }
 
 def _route_version(body=None):
@@ -1058,6 +1120,7 @@ def _route_version(body=None):
 DASHBOARD_GET_ROUTES = {
     "/api/devices": _route_devices,
     "/api/version": _route_version,
+    "/api/mqtt/status": _route_mqtt_status,
 }
 
 
@@ -1584,6 +1647,26 @@ def _mqtt_broker_stop(cfg, port):
         adb(cfg, "reverse", "--remove", f"tcp:{port}")
 
 
+def _mqtt_publish(topic, payload, host, port, qos=1, retain=False,
+                  tls=True, insecure=False):
+    """Publish one message with mosquitto_pub. Returns (ok, message)."""
+    pub = _mosquitto_bin("mosquitto_pub")
+    if not pub:
+        return False, "mosquitto_pub is not installed. Run `brew install mosquitto`."
+    cmd = [pub, "-h", host, "-p", str(port), "-t", topic, "-m", payload,
+           "-q", str(qos)]
+    if retain:
+        cmd.append("-r")
+    if tls:
+        cmd += ["--cafile", str(MQTT_CA_CERT)]
+        if insecure:
+            cmd.append("--insecure")
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        return False, f"mosquitto_pub failed: {(res.stderr or res.stdout).strip()}"
+    return True, f"published to {topic} on {host}:{port}"
+
+
 def cmd_mqtt(cfg, args):
     port = args.port or MQTT_DEFAULT_PORT
     host = args.host or "127.0.0.1"
@@ -1610,20 +1693,11 @@ def cmd_mqtt(cfg, args):
     if args.action == "pub":
         if not args.topic or args.payload is None:
             die("usage: proxyctl mqtt pub <topic> <payload>")
-        pub = _mosquitto_bin("mosquitto_pub")
-        if not pub:
-            die("mosquitto_pub is not installed. Run `brew install mosquitto`.")
-        cmd = [pub, "-h", host, "-p", str(port), "-t", args.topic,
-               "-m", args.payload, "-q", str(args.qos)]
-        if args.retain:
-            cmd.append("-r")
-        cmd += ["--cafile", str(MQTT_CA_CERT)] if args.tls else []
-        if args.tls and args.insecure:
-            cmd.append("--insecure")
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            die(f"mosquitto_pub failed: {(res.stderr or res.stdout).strip()}")
-        ok(f"published to {args.topic} on {host}:{port}")
+        ok_pub, msg = _mqtt_publish(args.topic, args.payload, host, port,
+                                    args.qos, args.retain, args.tls, args.insecure)
+        if not ok_pub:
+            die(msg)
+        ok(msg)
         return
 
     if args.action == "sub":

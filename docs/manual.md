@@ -213,6 +213,8 @@ The dashboard polls the flow log once a second. It shows:
   and a disconnect button per device.
 - A "restart app" button, and a restart link in the empty state.
 - The rules, with a per-rule enable/disable toggle.
+- A "send MQTT" panel: start or stop the local broker, paste a topic and a
+  message, and publish it to the app (see "Send raw MQTT").
 - The dev-proxy version, and an "update available" pill when the clone is
   behind.
 
