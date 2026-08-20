@@ -38,6 +38,15 @@ CONFIG_FILE = ROOT / "config.json"
 ADDON = ROOT / "addon" / "claude_addon.py"
 CA_DIR = Path.home() / ".mitmproxy"
 CA_PEM = CA_DIR / "mitmproxy-ca-cert.pem"
+CA_KEY_PEM = CA_DIR / "mitmproxy-ca.pem"  # cert + private key, used to sign the MQTT leaf
+MQTT_DIR = VAR / "mqtt"
+MQTT_CONF = MQTT_DIR / "mosquitto.conf"
+MQTT_PID_FILE = MQTT_DIR / "broker.pid"
+MQTT_LOG_FILE = MQTT_DIR / "broker.log"
+MQTT_CA_CERT = MQTT_DIR / "ca.crt"
+MQTT_BROKER_CERT = MQTT_DIR / "broker.crt"
+MQTT_BROKER_KEY = MQTT_DIR / "broker.key"
+MQTT_DEFAULT_PORT = 8883
 WEBUI_DIR = ROOT / "webui"
 WEB_PID_FILE = VAR / "webui.pid"
 WEB_LOG_FILE = VAR / "webui.log"
@@ -1029,11 +1038,73 @@ def _route_device_disconnect(body):
     return {"ok": True, "clear": clear, "proxy": proxy or None}
 
 
+def _route_mqtt_status(body=None):
+    """Local MQTT broker state for the dashboard panel."""
+    cfg = load_config()
+    port = MQTT_DEFAULT_PORT
+    reverse = False
+    if devices(cfg):
+        rev = adb(cfg, "reverse", "--list").stdout or ""
+        reverse = f"tcp:{port}" in rev
+    return {
+        "ok": True,
+        "running": bool(_mqtt_broker_pid()),
+        "port": port,
+        "reverse": reverse,
+        "mosquitto": _mosquitto_bin("mosquitto") is not None,
+        "override": f"ssl://127.0.0.1:{port}",
+    }
+
+
+def _route_mqtt_broker(body):
+    """Start or stop the local broker from the dashboard."""
+    try:
+        payload = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        raise DashboardRouteError(400, "malformed JSON body")
+    action = payload.get("action")
+    cfg = load_config()
+    if action == "start":
+        if not _mosquitto_bin("mosquitto"):
+            raise DashboardRouteError(400, "mosquitto is not installed. Run: brew install mosquitto")
+        if not CA_KEY_PEM.exists():
+            raise DashboardRouteError(400, "mitmproxy CA not found. Run `proxyctl start` once.")
+        _mqtt_broker_start(cfg, MQTT_DEFAULT_PORT)
+    elif action == "stop":
+        _mqtt_broker_stop(cfg, MQTT_DEFAULT_PORT)
+    else:
+        raise DashboardRouteError(400, 'expected {"action": "start"|"stop"}')
+    return _route_mqtt_status()
+
+
+def _route_mqtt_pub(body):
+    """Publish one message to the local broker, the paste-and-send path."""
+    try:
+        payload = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        raise DashboardRouteError(400, "malformed JSON body")
+    topic = (payload.get("topic") or "").strip()
+    message = payload.get("payload")
+    if not topic or message is None:
+        raise DashboardRouteError(400, 'expected {"topic": str, "payload": str}')
+    if not _mqtt_broker_pid():
+        raise DashboardRouteError(409, "the local broker is not running. Start it first.")
+    qos = payload.get("qos")
+    qos = int(qos) if qos in (0, 1, 2, "0", "1", "2") else 1
+    ok_pub, msg = _mqtt_publish(topic, str(message), "127.0.0.1",
+                                MQTT_DEFAULT_PORT, qos, bool(payload.get("retain")))
+    if not ok_pub:
+        raise DashboardRouteError(502, msg)
+    return {"ok": True, "topic": topic, "message": msg}
+
+
 DASHBOARD_ROUTES = {
     "/api/clear": lambda body: (_clear_flows(), {"ok": True})[1],
     "/api/rules/toggle": _route_toggle_rule,
     "/api/app/restart": _route_app_restart,
     "/api/device/disconnect": _route_device_disconnect,
+    "/api/mqtt/broker": _route_mqtt_broker,
+    "/api/mqtt/pub": _route_mqtt_pub,
 }
 
 def _route_version(body=None):
@@ -1049,6 +1120,7 @@ def _route_version(body=None):
 DASHBOARD_GET_ROUTES = {
     "/api/devices": _route_devices,
     "/api/version": _route_version,
+    "/api/mqtt/status": _route_mqtt_status,
 }
 
 
@@ -1416,6 +1488,240 @@ def cmd_mock(cfg, args):
     ok(f"rule {rule['id']} added. Edit the file, then reload the screen in the app.")
 
 
+# -------------------------------------------------------------------- mqtt
+#
+# The HTTP proxy cannot touch raw MQTT: the app opens its own TCP socket and
+# bypasses the global http_proxy. So instead of intercepting the real broker,
+# we run a local broker the app can point at, and publish into it by hand.
+#
+# The app connects over TLS (the Courier client forces the `ssl` scheme). A
+# plain broker is refused at the handshake. So the local broker serves a leaf
+# certificate signed by the mitmproxy CA. The device already trusts that CA in
+# a debug build (the same CA `proxyctl cert` installs), so the TLS handshake
+# succeeds with no extra taps.
+#
+# Flow for the user:
+#   1. proxyctl mqtt broker            # start the local TLS broker + adb reverse
+#   2. set the broker override in the app's debug settings to the printed URL
+#   3. proxyctl mqtt pub <topic> <payload>   # push a message the app receives
+
+
+def _mosquitto_bin(name="mosquitto"):
+    found = shutil.which(name)
+    if found:
+        return found
+    for base in ("/opt/homebrew/opt/mosquitto/sbin", "/opt/homebrew/bin",
+                 "/usr/local/sbin", "/usr/local/bin"):
+        cand = Path(base) / name
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+def _openssl(*a, **kw):
+    return subprocess.run(["openssl", *a], capture_output=True, text=True, **kw)
+
+
+def _ensure_broker_certs():
+    """Make the leaf cert the local broker serves, signed by the mitmproxy CA.
+
+    Regenerate when missing, or when the mitmproxy CA changed under us (a fresh
+    `mitmproxy` install rotates the CA, which would leave a stale leaf the
+    device no longer trusts).
+    """
+    if not CA_KEY_PEM.exists():
+        die(f"mitmproxy CA key not found at {CA_KEY_PEM}. Run `proxyctl start` "
+            "once to generate it.")
+    MQTT_DIR.mkdir(parents=True, exist_ok=True)
+
+    ca_cert_src = CA_PEM.read_text()
+    fresh = (
+        MQTT_BROKER_CERT.exists()
+        and MQTT_BROKER_KEY.exists()
+        and MQTT_CA_CERT.exists()
+        and MQTT_CA_CERT.read_text() == ca_cert_src
+    )
+    if fresh:
+        return
+
+    info("generating a broker certificate signed by the mitmproxy CA")
+    MQTT_CA_CERT.write_text(ca_cert_src)
+    ca_key = MQTT_DIR / "ca.key"
+    res = _openssl("rsa", "-in", str(CA_KEY_PEM), "-out", str(ca_key))
+    if res.returncode != 0:
+        die(f"openssl could not read the CA key: {res.stderr.strip()}")
+    res = _openssl("genrsa", "-out", str(MQTT_BROKER_KEY), "2048")
+    if res.returncode != 0:
+        die(f"openssl genrsa failed: {res.stderr.strip()}")
+    csr = MQTT_DIR / "broker.csr"
+    res = _openssl("req", "-new", "-key", str(MQTT_BROKER_KEY), "-out", str(csr),
+                   "-subj", "/CN=127.0.0.1/O=dev-proxy-mqtt")
+    if res.returncode != 0:
+        die(f"openssl req failed: {res.stderr.strip()}")
+    ext = MQTT_DIR / "broker.ext"
+    ext.write_text("subjectAltName=IP:127.0.0.1,DNS:localhost\n"
+                   "extendedKeyUsage=serverAuth\n")
+    res = _openssl("x509", "-req", "-in", str(csr), "-CA", str(MQTT_CA_CERT),
+                   "-CAkey", str(ca_key), "-CAcreateserial",
+                   "-out", str(MQTT_BROKER_CERT), "-days", "3650",
+                   "-extfile", str(ext))
+    if res.returncode != 0:
+        die(f"openssl x509 sign failed: {res.stderr.strip()}")
+    for junk in (ca_key, csr, ext, MQTT_DIR / "ca.srl"):
+        junk.unlink(missing_ok=True)
+    try:
+        MQTT_BROKER_KEY.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _mqtt_broker_pid():
+    if not MQTT_PID_FILE.exists():
+        return None
+    try:
+        pid = int(MQTT_PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+    except (ValueError, OSError):
+        return None
+    return pid
+
+
+def _mqtt_broker_start(cfg, port):
+    if _mqtt_broker_pid():
+        warn(f"local broker already runs on port {port} (pid {_mqtt_broker_pid()})")
+        return
+    mosq = _mosquitto_bin("mosquitto")
+    if not mosq:
+        die("mosquitto is not installed. Run `brew install mosquitto`.")
+    _ensure_broker_certs()
+    MQTT_CONF.write_text(
+        f"listener {port} 0.0.0.0\n"
+        "allow_anonymous true\n"
+        f"cafile {MQTT_CA_CERT}\n"
+        f"certfile {MQTT_BROKER_CERT}\n"
+        f"keyfile {MQTT_BROKER_KEY}\n"
+        "tls_version tlsv1.2\n"
+        "require_certificate false\n"
+    )
+    with MQTT_LOG_FILE.open("a") as logfh:
+        logfh.write(f"\n=== start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        proc = subprocess.Popen(
+            [mosq, "-c", str(MQTT_CONF)],
+            stdout=logfh, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    time.sleep(0.6)
+    if proc.poll() is not None:
+        print(MQTT_LOG_FILE.read_text()[-1500:])
+        die("mosquitto exited immediately. See the log above.")
+    MQTT_PID_FILE.write_text(str(proc.pid))
+    ok(f"local MQTT broker listens on 0.0.0.0:{port} (pid {proc.pid}), TLS via the mitmproxy CA")
+
+    # Bridge the device to the Mac broker. adb reverse makes the phone's own
+    # 127.0.0.1:<port> tunnel back here, so the broker override can stay
+    # localhost and needs no LAN IP.
+    if devices(cfg):
+        adb(cfg, "reverse", f"tcp:{port}", f"tcp:{port}")
+        ok(f"adb reverse tcp:{port} set, so the device reaches this broker on localhost")
+    else:
+        warn("no device attached, so adb reverse was skipped")
+    print()
+    print(f"  Set the broker override in the app to: {C['bold']}ssl://127.0.0.1:{port}{C['off']}")
+    print("  (moj debug menu: Override Live MQTT broker), then restart the app.")
+    print(f"  Publish with: proxyctl mqtt pub <topic> '<payload>'")
+    print(f"  log: {MQTT_LOG_FILE}")
+
+
+def _mqtt_broker_stop(cfg, port):
+    pid = _mqtt_broker_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        MQTT_PID_FILE.unlink(missing_ok=True)
+        ok(f"local broker stopped (pid {pid})")
+    else:
+        warn("local broker is not running")
+        MQTT_PID_FILE.unlink(missing_ok=True)
+    if devices(cfg):
+        adb(cfg, "reverse", "--remove", f"tcp:{port}")
+
+
+def _mqtt_publish(topic, payload, host, port, qos=1, retain=False,
+                  tls=True, insecure=False):
+    """Publish one message with mosquitto_pub. Returns (ok, message)."""
+    pub = _mosquitto_bin("mosquitto_pub")
+    if not pub:
+        return False, "mosquitto_pub is not installed. Run `brew install mosquitto`."
+    cmd = [pub, "-h", host, "-p", str(port), "-t", topic, "-m", payload,
+           "-q", str(qos)]
+    if retain:
+        cmd.append("-r")
+    if tls:
+        cmd += ["--cafile", str(MQTT_CA_CERT)]
+        if insecure:
+            cmd.append("--insecure")
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        return False, f"mosquitto_pub failed: {(res.stderr or res.stdout).strip()}"
+    return True, f"published to {topic} on {host}:{port}"
+
+
+def cmd_mqtt(cfg, args):
+    port = args.port or MQTT_DEFAULT_PORT
+    host = args.host or "127.0.0.1"
+
+    if args.action == "broker":
+        if args.stop:
+            _mqtt_broker_stop(cfg, port)
+        else:
+            _mqtt_broker_start(cfg, port)
+        return
+
+    if args.action == "status":
+        pid = _mqtt_broker_pid()
+        if pid:
+            ok(f"local broker running on port {port} (pid {pid})")
+        else:
+            info("local broker is not running")
+        if devices(cfg):
+            rev = adb(cfg, "reverse", "--list").stdout or ""
+            state = "set" if f"tcp:{port}" in rev else "not set"
+            info(f"adb reverse tcp:{port} is {state}")
+        return
+
+    if args.action == "pub":
+        if not args.topic or args.payload is None:
+            die("usage: proxyctl mqtt pub <topic> <payload>")
+        ok_pub, msg = _mqtt_publish(args.topic, args.payload, host, port,
+                                    args.qos, args.retain, args.tls, args.insecure)
+        if not ok_pub:
+            die(msg)
+        ok(msg)
+        return
+
+    if args.action == "sub":
+        if not args.topic:
+            die("usage: proxyctl mqtt sub <topic>")
+        sub = _mosquitto_bin("mosquitto_sub")
+        if not sub:
+            die("mosquitto_sub is not installed. Run `brew install mosquitto`.")
+        cmd = [sub, "-h", host, "-p", str(port), "-t", args.topic, "-v"]
+        if args.count:
+            cmd += ["-C", str(args.count)]
+        if args.timeout:
+            cmd += ["-W", str(args.timeout)]
+        cmd += ["--cafile", str(MQTT_CA_CERT)] if args.tls else []
+        if args.tls and args.insecure:
+            cmd.append("--insecure")
+        info(f"watching {args.topic} on {host}:{port}. Press Ctrl-C to stop.")
+        try:
+            subprocess.run(cmd)
+        except KeyboardInterrupt:
+            print()
+        return
+
+
 # --------------------------------------------------------------------- cli
 
 def main():
@@ -1537,6 +1843,23 @@ def main():
     sp.add_argument("action", choices=["start", "stop", "restart"])
     sp.add_argument("--package")
     sp.set_defaults(fn=cmd_app)
+
+    sp = sub.add_parser("mqtt", help="run a local MQTT broker and publish to it")
+    sp.add_argument("action", choices=["broker", "pub", "sub", "status"])
+    sp.add_argument("topic", nargs="?", help="topic for pub/sub")
+    sp.add_argument("payload", nargs="?", help="message payload for pub")
+    sp.add_argument("--stop", action="store_true", help="broker: stop it")
+    sp.add_argument("--host", help="broker host (default 127.0.0.1)")
+    sp.add_argument("--port", type=int, help=f"broker port (default {MQTT_DEFAULT_PORT})")
+    sp.add_argument("--qos", type=int, default=1, choices=[0, 1, 2])
+    sp.add_argument("--retain", action="store_true", help="pub: set the retain flag")
+    sp.add_argument("--count", type=int, help="sub: stop after N messages")
+    sp.add_argument("--timeout", type=int, help="sub: stop after N seconds")
+    sp.add_argument("--no-tls", dest="tls", action="store_false",
+                    help="talk plain TCP instead of TLS (a non-default broker)")
+    sp.add_argument("--insecure", action="store_true",
+                    help="TLS without verifying the broker certificate")
+    sp.set_defaults(fn=cmd_mqtt, tls=True)
 
     args = p.parse_args()
     if not getattr(args, "fn", None):

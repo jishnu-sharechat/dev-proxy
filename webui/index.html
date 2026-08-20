@@ -199,6 +199,55 @@
     font-size: 12px; margin-bottom: 14px;
   }
   .why b { display: block; margin-bottom: 2px; }
+
+  /* MQTT send panel */
+  .mqtt-panel {
+    position: fixed; top: 92px; right: 16px; z-index: 40; width: 380px;
+    max-width: calc(100vw - 32px);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.22); padding: 14px 15px;
+  }
+  .mqtt-panel[hidden] { display: none; }
+  .mqtt-panel h2 {
+    font-size: 13px; font-weight: 650; margin: 0 0 2px; display: flex;
+    align-items: center; gap: 8px;
+  }
+  .mqtt-panel .sub { color: var(--text-muted); font-size: 11.5px; margin: 0 0 12px; }
+  .mqtt-panel .close {
+    margin-left: auto; background: none; border: none; color: var(--text-dim);
+    font-size: 16px; cursor: pointer; line-height: 1; padding: 0;
+  }
+  .mqtt-broker {
+    display: flex; align-items: center; gap: 8px; background: var(--code-bg);
+    border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; margin-bottom: 12px;
+  }
+  .mqtt-broker .bdot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); flex-shrink: 0; }
+  .mqtt-broker.up .bdot { background: var(--good); }
+  .mqtt-broker .btxt { font-size: 11.5px; color: var(--text-muted); flex: 1; }
+  .mqtt-broker .btxt b { color: var(--text); font-weight: 600; }
+  .mqtt-broker .override { font-family: ui-monospace, monospace; font-size: 10.5px; color: var(--text-dim); display: block; margin-top: 1px; }
+  .mqtt-field { margin-bottom: 10px; }
+  .mqtt-field label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 4px; font-weight: 600; }
+  .mqtt-field input, .mqtt-field textarea, .mqtt-field select {
+    width: 100%; background: var(--code-bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 7px 9px; font-size: 12px; font-family: inherit;
+  }
+  .mqtt-field textarea { resize: vertical; min-height: 84px; font: 12px/1.5 ui-monospace, Menlo, monospace; }
+  .mqtt-opts { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }
+  .mqtt-opts label { font-size: 11.5px; color: var(--text-muted); display: flex; align-items: center; gap: 5px; }
+  .mqtt-opts select { width: auto; padding: 4px 6px; }
+  .mqtt-actions { display: flex; align-items: center; gap: 10px; }
+  .mqtt-btn {
+    border: 1px solid var(--border); background: var(--code-bg); color: var(--text);
+    border-radius: 6px; padding: 6px 12px; font-size: 12px; font-family: inherit; cursor: pointer;
+  }
+  .mqtt-btn:hover { background: var(--row-hover); }
+  .mqtt-btn:disabled { opacity: .5; cursor: default; }
+  .mqtt-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .mqtt-btn.primary:hover { filter: brightness(1.05); }
+  .mqtt-result { font-size: 11.5px; margin-left: auto; min-height: 15px; }
+  .mqtt-result.ok { color: var(--good); }
+  .mqtt-result.err { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -225,9 +274,40 @@
   <button id="btnReset">reset filters</button>
   <button id="btnClear">clear</button>
   <button id="btnAppRestart" title="force-stop and start the app under test">restart app</button>
+  <button id="btnMqtt" title="send a raw MQTT message to the app">send MQTT</button>
   <div class="rulebar-wrap">
     <div class="rulebar" id="ruleBar">loading rules…</div>
     <div class="rules-panel" id="rulesPanel"></div>
+  </div>
+</div>
+
+<div class="mqtt-panel" id="mqttPanel" hidden>
+  <h2>send MQTT <button class="close" id="mqttClose" title="close">&times;</button></h2>
+  <p class="sub">Publish a raw message to the local broker the app is pointed at.</p>
+
+  <div class="mqtt-broker" id="mqttBroker">
+    <span class="bdot"></span>
+    <span class="btxt" id="mqttBrokerTxt">checking the local broker…</span>
+    <button class="mqtt-btn" id="mqttBrokerBtn" disabled>…</button>
+  </div>
+
+  <div class="mqtt-field">
+    <label for="mqttTopic">topic</label>
+    <input type="text" id="mqttTopic" placeholder="e.g. live/room/42" autocomplete="off">
+  </div>
+  <div class="mqtt-field">
+    <label for="mqttPayload">message</label>
+    <textarea id="mqttPayload" placeholder='{"type":"GIFT","amount":100}'></textarea>
+  </div>
+  <div class="mqtt-opts">
+    <label>QoS
+      <select id="mqttQos"><option>0</option><option selected>1</option><option>2</option></select>
+    </label>
+    <label><input type="checkbox" id="mqttRetain"> retain</label>
+  </div>
+  <div class="mqtt-actions">
+    <button class="mqtt-btn primary" id="mqttSend">send</button>
+    <span class="mqtt-result" id="mqttResult"></span>
   </div>
 </div>
 
@@ -528,6 +608,127 @@ async function appRestart() {
 }
 
 $("#btnAppRestart").addEventListener("click", appRestart);
+
+// ---- send MQTT panel ----
+let mqttBusy = false;
+
+function setMqttResult(msg, kind) {
+  const el = $("#mqttResult");
+  el.textContent = msg || "";
+  el.className = "mqtt-result" + (kind ? " " + kind : "");
+}
+
+function renderMqttStatus(s) {
+  const box = $("#mqttBroker"), btn = $("#mqttBrokerBtn");
+  const txt = $("#mqttBrokerTxt"), send = $("#mqttSend");
+  if (!s || !s.ok) {
+    box.classList.remove("up");
+    txt.innerHTML = "broker status unavailable";
+    btn.disabled = true; btn.textContent = "…";
+    return;
+  }
+  if (!s.mosquitto) {
+    box.classList.remove("up");
+    txt.innerHTML = "<b>mosquitto not installed.</b> Run <code>brew install mosquitto</code>.";
+    btn.disabled = true; btn.textContent = "start";
+    send.disabled = true;
+    return;
+  }
+  if (s.running) {
+    box.classList.add("up");
+    const rev = s.reverse ? "" : " · <b style='color:var(--warn)'>no adb reverse</b>";
+    txt.innerHTML = "<b>broker running</b> on port " + s.port + rev +
+      "<span class='override'>override: " + s.override + "</span>";
+    btn.disabled = false; btn.textContent = "stop";
+    send.disabled = false;
+  } else {
+    box.classList.remove("up");
+    txt.innerHTML = "broker stopped";
+    btn.disabled = false; btn.textContent = "start";
+    send.disabled = true;
+  }
+}
+
+async function refreshMqttStatus() {
+  try {
+    const res = await fetch("/api/mqtt/status?t=" + Date.now(), {cache: "no-store"});
+    renderMqttStatus(await res.json());
+  } catch (e) {
+    renderMqttStatus(null);
+  }
+}
+
+async function toggleBroker() {
+  if (mqttBusy) return;
+  mqttBusy = true;
+  const btn = $("#mqttBrokerBtn");
+  const action = btn.textContent === "stop" ? "stop" : "start";
+  btn.disabled = true; btn.textContent = action === "stop" ? "stopping…" : "starting…";
+  try {
+    const res = await fetch("/api/mqtt/broker", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
+    renderMqttStatus(data);
+    setMqttResult("", "");
+  } catch (e) {
+    setMqttResult(e.message, "err");
+    refreshMqttStatus();
+  } finally {
+    mqttBusy = false;
+  }
+}
+
+async function sendMqtt() {
+  if (mqttBusy) return;
+  const topic = $("#mqttTopic").value.trim();
+  const payload = $("#mqttPayload").value;
+  if (!topic) { setMqttResult("enter a topic", "err"); return; }
+  if (!payload) { setMqttResult("enter a message", "err"); return; }
+  mqttBusy = true;
+  const send = $("#mqttSend");
+  send.disabled = true; send.textContent = "sending…";
+  setMqttResult("", "");
+  try {
+    const res = await fetch("/api/mqtt/pub", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        topic, payload,
+        qos: Number($("#mqttQos").value),
+        retain: $("#mqttRetain").checked,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
+    setMqttResult("sent to " + topic, "ok");
+  } catch (e) {
+    setMqttResult(e.message, "err");
+  } finally {
+    mqttBusy = false;
+    send.textContent = "send";
+    refreshMqttStatus();
+  }
+}
+
+function openMqtt() {
+  $("#mqttPanel").hidden = false;
+  refreshMqttStatus();
+  $("#mqttTopic").focus();
+}
+function closeMqtt() { $("#mqttPanel").hidden = true; }
+
+$("#btnMqtt").addEventListener("click", () => {
+  $("#mqttPanel").hidden ? openMqtt() : closeMqtt();
+});
+$("#mqttClose").addEventListener("click", closeMqtt);
+$("#mqttBrokerBtn").addEventListener("click", toggleBroker);
+$("#mqttSend").addEventListener("click", sendMqtt);
+// Cmd/Ctrl+Enter in the message box sends.
+$("#mqttPayload").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") sendMqtt();
+});
 
 $("#rows").addEventListener("click", (e) => {
   if (e.target.closest(".appRestart")) { appRestart(); return; }

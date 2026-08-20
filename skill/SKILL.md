@@ -1,6 +1,6 @@
 ---
 name: dev-proxy
-description: Inspect and manipulate Android network traffic through a local mitmproxy. Use for any request about seeing what the app sends or receives, mocking or stubbing an API response, forcing an error or a timeout, adding latency, flipping a server-driven feature flag or experiment, redirecting a host to staging or localhost, or exporting a HAR. This replaces Charles Proxy map-local, map-remote, rewrite, block, and throttle. Triggers on "what does the app call", "mock this endpoint", "map local", "map remote", "make this API fail", "simulate slow network", "simulate offline", "override the response", "change the API response", "intercept traffic", "check the request payload", "why is this call failing", "capture traffic", "export HAR".
+description: Inspect and manipulate Android network traffic through a local mitmproxy. Use for any request about seeing what the app sends or receives, mocking or stubbing an API response, forcing an error or a timeout, adding latency, flipping a server-driven feature flag or experiment, redirecting a host to staging or localhost, exporting a HAR, or sending raw MQTT messages to the app through a local broker. This replaces Charles Proxy map-local, map-remote, rewrite, block, and throttle. Triggers on "what does the app call", "mock this endpoint", "map local", "map remote", "make this API fail", "simulate slow network", "simulate offline", "override the response", "change the API response", "intercept traffic", "check the request payload", "why is this call failing", "capture traffic", "export HAR", "send an mqtt message", "publish to a topic", "test a livestream event", "local mqtt broker".
 ---
 
 # dev-proxy
@@ -130,6 +130,46 @@ It creates the file when the file is missing. It seeds the file from the
 newest captured response for that URL when one exists. Host and path are
 literals here, not regexes. Pass `--regex` for patterns. Edits to the file
 apply on the next request. Never restart the proxy for a file edit.
+
+## Send raw MQTT to the app
+
+The HTTP proxy cannot touch raw MQTT. The app opens its own TCP socket and
+bypasses the device `http_proxy`. So do not try to intercept the real broker.
+Instead run a local broker, point the app at it, and publish messages by hand.
+
+The app connects over TLS. A plain broker fails the handshake. The local broker
+serves a certificate signed by the mitmproxy CA. The device already trusts that
+CA in a debug build, so the handshake succeeds with no extra taps. `mosquitto`
+must be installed (`brew install mosquitto`).
+
+```bash
+proxyctl mqtt broker                       # start the local TLS broker + adb reverse
+proxyctl mqtt pub live/room/42 '{"type":"GIFT"}'   # push one message
+proxyctl mqtt sub live/room/42             # watch a topic
+proxyctl mqtt broker --stop                # stop it, remove the reverse
+```
+
+Steps to make the app receive a message:
+
+1. Run `proxyctl mqtt broker`. It prints a broker override URL, for example
+   `ssl://127.0.0.1:8883`.
+2. In the app, set that URL as the broker override, then restart the app. In
+   moj this is the debug menu item "Override Live MQTT broker".
+3. Find the topic the app subscribes to. The app gets its topics from an HTTP
+   response, so the proxy can read them. For a moj livestream, open the stream
+   and check the enter-stream response with `proxyctl flows` for the topic list.
+4. Run `proxyctl mqtt pub <topic> '<payload>'`. The app receives it.
+
+`pub` and `sub` default to the local broker (`127.0.0.1:8883`, TLS). Point them
+at another broker with `--host`, `--port`, and `--no-tls`. Useful flags:
+`--qos`, `--retain`, and for `sub` the `--count` and `--timeout` limits.
+
+The web dashboard (`proxyctl web`) has the same as a form. Click **send MQTT**
+in the toolbar to open a panel: start or stop the broker, paste a topic and a
+message, and hit **send**. This is the paste-and-send path when you do not want
+the terminal.
+
+Clear the broker override in the app to return to the real broker.
 
 ## Clean up
 
